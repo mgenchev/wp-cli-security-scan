@@ -1,0 +1,14 @@
+{
+    "rules": [
+        {"id":"db_php_code","regex":"~<\\?php|<\\?=~i","severity":"critical","confidence":98,"description":"PHP code stored in database content"},
+        {"id":"db_eval","regex":"~\\beval\\s*\\(~i","severity":"high","confidence":90,"description":"eval() found in database content"},
+        {"id":"db_base64_decode","regex":"~base64_decode\\s*\\(~i","severity":"high","confidence":91,"description":"base64_decode() found in database content"},
+        {"id":"db_gzinflate","regex":"~(?:gzinflate|gzuncompress)\\s*\\(~i","severity":"high","confidence":91,"description":"Compressed payload decoder found in database"},
+        {"id":"db_command_execution","regex":"~(?:system|exec|shell_exec|passthru|proc_open|popen)\\s*\\(~i","severity":"critical","confidence":95,"description":"OS command execution code stored in database"},
+        {"id":"db_phpinfo","regex":"~phpinfo\\s*\\(~i","severity":"high","confidence":88,"description":"phpinfo() code stored in database"},
+        {"id":"db_script","regex":"~<script\\b~i","severity":"medium","confidence":55,"description":"Embedded script tag requires review"},
+        {"id":"db_hidden_iframe","regex":"~<iframe[^>]+(?:display\\s*:\\s*none|visibility\\s*:\\s*hidden|width\\s*=\\s*[\\'\"]?0|height\\s*=\\s*[\\'\"]?0)~is","severity":"high","confidence":88,"description":"Hidden iframe stored in database"},
+        {"id":"db_javascript_uri","regex":"~javascript\\s*:~i","severity":"high","confidence":80,"description":"javascript: URI stored in database"},
+        {"id":"db_long_base64","regex":"~[A-Za-z0-9+/]{800,}={0,2}~","severity":"medium","confidence":70,"description":"Large Base64-looking payload stored in database"}
+    ]
+}

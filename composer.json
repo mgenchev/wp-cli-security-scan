@@ -1,0 +1,29 @@
+{
+    "name": "mgenchev/wp-cli-security-scan",
+    "description": "Read-only WP-CLI security scanner for compromised WordPress sites.",
+    "type": "wp-cli-package",
+    "license": "MIT",
+    "homepage": "https://github.com/mgenchev/wp-cli-security-scan",
+    "support": {
+        "issues": "https://github.com/mgenchev/wp-cli-security-scan/issues",
+        "source": "https://github.com/mgenchev/wp-cli-security-scan"
+    },
+    "keywords": [
+        "wordpress",
+        "wp-cli",
+        "security",
+        "malware",
+        "security-scan",
+        "incident-response",
+        "wordpress-malware"
+    ],
+    "require": {
+        "php": ">=7.4",
+        "wp-cli/wp-cli": ">=2.8"
+    },
+    "autoload": {
+        "files": [
+            "src/SecurityScanCommand.php"
+        ]
+    }
+}

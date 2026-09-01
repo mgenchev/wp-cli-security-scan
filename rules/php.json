@@ -1,0 +1,109 @@
+{
+    "rules": [
+        {
+            "id": "php_eval_decode",
+            "regex": "~eval\\s*\\(\\s*(?:base64_decode|gzinflate|gzuncompress|str_rot13|rawurldecode|urldecode)\\s*\\(~i",
+            "severity": "critical",
+            "confidence": 99,
+            "description": "Encoded payload executed with eval"
+        },
+        {
+            "id": "php_assert_input",
+            "regex": "~assert\\s*\\(\\s*\\$_(?:GET|POST|REQUEST|COOKIE)~i",
+            "severity": "critical",
+            "confidence": 99,
+            "description": "Request input executed through assert"
+        },
+        {
+            "id": "php_command_input",
+            "regex": "~(?:system|exec|shell_exec|passthru|popen|proc_open)\\s*\\([^;]{0,300}\\$_(?:GET|POST|REQUEST|COOKIE)~is",
+            "severity": "critical",
+            "confidence": 99,
+            "description": "Request input reaches OS command execution"
+        },
+        {
+            "id": "php_dynamic_input_call",
+            "regex": "~\\$[A-Za-z_][A-Za-z0-9_]*\\s*=\\s*\\$_(?:GET|POST|REQUEST|COOKIE)[^;]{0,200};[^;]{0,300}\\$[A-Za-z_][A-Za-z0-9_]*\\s*\\(~is",
+            "severity": "critical",
+            "confidence": 96,
+            "description": "Request-controlled dynamic function execution"
+        },
+        {
+            "id": "php_preg_replace_e",
+            "regex": "~preg_replace\\s*\\([^;]{0,250}/e[\\'\"]~is",
+            "severity": "high",
+            "confidence": 95,
+            "description": "Deprecated preg_replace /e code execution pattern"
+        },
+        {
+            "id": "php_remote_write",
+            "regex": "~(?:file_get_contents|curl_exec|fopen|copy)\\s*\\([^;]{0,500}https?://[^;]{0,800}(?:file_put_contents|fwrite|copy|rename|move_uploaded_file)~is",
+            "severity": "critical",
+            "confidence": 95,
+            "description": "Remote payload retrieval followed by local file write"
+        },
+        {
+            "id": "php_remote_execute",
+            "regex": "~(?:file_get_contents|curl_exec|fopen)\\s*\\([^;]{0,500}https?://[^;]{0,800}(?:eval|include|include_once|require|require_once)\\s*\\(?~is",
+            "severity": "critical",
+            "confidence": 97,
+            "description": "Remote content retrieval followed by execution"
+        },
+        {
+            "id": "php_request_file_write",
+            "regex": "~(?:file_put_contents|fwrite)\\s*\\([^;]{0,500}\\$_(?:GET|POST|REQUEST|COOKIE)~is",
+            "severity": "high",
+            "confidence": 93,
+            "description": "Request-controlled filesystem write"
+        },
+        {
+            "id": "php_upload_handler",
+            "regex": "~move_uploaded_file\\s*\\([^;]{0,500}\\$_FILES~is",
+            "severity": "medium",
+            "confidence": 62,
+            "description": "Direct file upload handler requires review"
+        },
+        {
+            "id": "php_long_base64_decoder",
+            "regex": "~(?:base64_decode|gzinflate|gzuncompress)\\s*\\(\\s*[\\'\"][A-Za-z0-9+/=]{400,}[\\'\"]~is",
+            "severity": "critical",
+            "confidence": 97,
+            "description": "Large encoded PHP payload"
+        },
+        {
+            "id": "php_chr_obfuscation",
+            "regex": "~(?:chr\\s*\\(\\s*\\d+\\s*\\)\\s*\\.?\\s*){12,}~i",
+            "severity": "high",
+            "confidence": 89,
+            "description": "Heavy chr() string obfuscation"
+        },
+        {
+            "id": "php_hex_obfuscation",
+            "regex": "~(?:\\\\x[0-9a-fA-F]{2}){16,}~",
+            "severity": "high",
+            "confidence": 86,
+            "description": "Long hexadecimal escaped payload"
+        },
+        {
+            "id": "php_variable_variables",
+            "regex": "~(?:\\$\\$[A-Za-z_][A-Za-z0-9_]*|\\$\\{\\$[A-Za-z_][A-Za-z0-9_]*\\})\\s*\\(~",
+            "severity": "high",
+            "confidence": 88,
+            "description": "Variable-variable dynamic function execution"
+        },
+        {
+            "id": "php_admin_creation",
+            "regex": "~(?:wp_create_user|wp_insert_user|wp_update_user)[\\s\\S]{0,1500}(?:administrator|manage_options)~i",
+            "severity": "high",
+            "confidence": 84,
+            "description": "Code creates or promotes an administrator account"
+        },
+        {
+            "id": "php_plugin_hiding",
+            "regex": "~add_filter\\s*\\(\\s*[\\'\"]all_plugins[\\'\"][\\s\\S]{0,1200}unset\\s*\\(~i",
+            "severity": "high",
+            "confidence": 86,
+            "description": "Plugin attempts to hide entries from the plugin list"
+        }
+    ]
+}
