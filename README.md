@@ -9,14 +9,15 @@ The package is designed for a workflow where a site's `wp-content` directory and
 A full scan runs in separate stages:
 
 1. WordPress core checksum verification (`wp core verify-checksums`)
-2. WordPress.org plugin checksum verification
-3. Plugins
-4. MU plugins and WordPress drop-ins
-5. Themes
-6. Uploads
-7. Other directories/files inside `wp-content`
-8. Database content
-9. Users and persistence data
+2. Plugin source/repository reputation
+3. WordPress.org plugin checksum verification
+4. Plugins
+5. MU plugins and WordPress drop-ins
+6. Themes
+7. Uploads
+8. Other directories/files inside `wp-content`
+9. Database content
+10. Users and persistence data
 
 The scanner is **read-only**. It does not remove, quarantine, edit, or repair files or database records.
 
@@ -126,6 +127,7 @@ Completed stages remain visible. Checksum stages intentionally do not display a 
 
 ```text
 ✓ Core checksums completed — no integrity issues found
+✓ Plugin reputation checked — 18 WordPress.org, 3 external, 1 unknown, no reputation warnings found
 ⚠ Plugin integrity completed — 18 verified, 3 unavailable, 1 modified, 2 integrity issues found
 ⚠ Plugins scanned — 3,210 files, 3 reportable threats found
 ✓ Uploads scanned — 8,409 files, no threats found
@@ -142,7 +144,7 @@ wp security-scan database
 wp security-scan core
 ```
 
-`plugins` also checks MU plugins/drop-ins and WordPress.org plugin checksums.
+`plugins` also checks plugin reputation, WordPress.org plugin checksums, and MU plugins/drop-ins.
 
 ## Example report
 
@@ -236,9 +238,25 @@ Patterns include PHP code, `eval()`, `base64_decode()`, gzip decoders, `phpinfo(
 Raw contents of database dumps, source maps and compressed archives are skipped by the static code scanner (`.sql`, `.dump`, `.zip`, `.gz`, `.tar`, `.7z`, `.rar`, `.map`, etc.). These files can legitimately contain historical malware strings or bundled source text but are not directly executable by WordPress/PHP. Executable files placed beside them are still scanned normally.
 
 
+## Plugin reputation
+
+Before checksum verification, the scanner classifies the installed plugin source. It sends one read-only bulk update-check request to WordPress.org for the complete installed-plugin inventory, then performs individual repository lookups only for unresolved slugs. This avoids making one repository request for every verified plugin.
+
+Reputation currently distinguishes:
+
+- **WordPress.org** — the plugin is recognized by the official plugin directory/update API;
+- **External** — the plugin declares a non-WordPress.org `Update URI`, typical for premium/vendor-managed plugins;
+- **Unknown** — the source cannot be verified automatically;
+- **Repository risk** — WordPress.org reports the plugin as closed/disabled;
+- **Known malicious** — the slug/version matches one of the package's own high-confidence reputation rules.
+
+Repository/reputation rules are independent from checksums. This means a plugin can match official checksums but still remain visible when there is a strong upstream/source risk. Reputation rules live in `rules/plugin-reputation.json` and can be extended without changing the scanner engine.
+
+The reputation stage is read-only and does not call `wp_update_plugins()`, so it does not write WordPress update transients.
+
 ## Plugin integrity, risk scoring, and remediation
 
-Plugin checksum integrity is the primary trust signal for normal WordPress.org plugins. The scanner still performs the static code scan, but the human-readable and JSON reports apply the checksum result before plugin findings are exposed:
+Plugin reputation is evaluated first, then checksum integrity becomes the primary local-tampering signal for normal WordPress.org plugins. The scanner still performs the static code scan, but the human-readable and JSON reports apply the checksum result before plugin findings are exposed:
 
 - **Verified** — `wp plugin verify-checksums --strict` matches the installed plugin version. Ordinary static heuristic findings are suppressed because they are part of the official release rather than local tampering.
 - **Modified** — one or more files fail checksum verification or a required plugin file is missing. The report strongly recommends replacing the entire plugin with a fresh trusted copy and rescanning.
@@ -283,11 +301,12 @@ Checksum-failed plugins receive the reinstall recommendation regardless of stati
 A successful checksum proves that the local files match the upstream WordPress.org release; it does **not** prove that the upstream release itself is safe. To preserve this distinction, verified plugins suppress ordinary heuristics but still allow independent plugin-risk signals:
 
 - WordPress.org reports the plugin as closed or disabled;
+- the plugin matches an exact high-confidence rule from `rules/plugin-reputation.json`;
 - a `CRITICAL` exact known IOC with at least 97% confidence is present in executable PHP/JavaScript code.
 
 Repository closure is treated separately from malware heuristics because a plugin can be closed for reasons other than security. If the WordPress.org response explicitly indicates a security-related closure, the finding is raised accordingly.
 
-The normalized JSON report also includes a `plugin_integrity` map with each installed plugin's checksum and repository status.
+The normalized JSON report also includes a `plugin_integrity` map with each installed plugin's checksum status, detected source, reputation state, and repository status.
 
 
 ## Severity and confidence
@@ -340,6 +359,12 @@ Skip core integrity verification:
 wp security-scan --skip-core-checksums
 ```
 
+Skip plugin source/repository reputation checks:
+
+```bash
+wp security-scan --skip-plugin-reputation
+```
+
 Skip WordPress.org plugin checksum verification:
 
 ```bash
@@ -354,9 +379,10 @@ Exact indicators are stored in:
 
 ```text
 rules/iocs.json
+rules/plugin-reputation.json
 ```
 
-This includes public malware/web-shell fingerprints and field indicators observed during real cleanup work. New confirmed indicators can be added without modifying `SecurityScanCommand.php`.
+These include public malware/web-shell fingerprints and field indicators observed during real cleanup work. New confirmed indicators can be added without modifying `SecurityScanCommand.php`.
 
 ## Version
 

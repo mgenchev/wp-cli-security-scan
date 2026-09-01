@@ -1,5 +1,26 @@
 # Changelog
 
+## [0.3.1] - 2026-09-01
+
+### Added
+
+- Added a dedicated plugin reputation stage before checksum verification.
+- Added source classification for WordPress.org, external/vendor-managed, and unknown plugins.
+- Added a read-only bulk WordPress.org plugin inventory request, with individual repository probes only for unresolved slugs.
+- Added extensible exact plugin reputation rules in `rules/plugin-reputation.json`.
+- Added plugin reputation/source metadata to the existing plugin integrity state and JSON report.
+- Added plugin reputation regression tests.
+
+### Changed
+
+- Moved WordPress.org closed/disabled repository checks out of the checksum stage, so plugin integrity timing now reflects checksum verification rather than additional per-plugin reputation requests.
+- Verified plugin findings continue to be suppressed normally, while independent reputation risks remain reportable even when checksums match.
+- Human-readable grouped plugin findings now show the detected plugin source.
+
+### Performance
+
+- Replaced the previous one repository HTTP request per verified plugin with one bulk WordPress.org update-check request plus follow-up requests only for unresolved plugins.
+
 ## [0.3.0] - 2026-09-01
 
 ### Added

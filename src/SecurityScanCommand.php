@@ -10,7 +10,7 @@ if ( ! defined( 'WP_CLI' ) || ! WP_CLI ) {
 }
 
 class Security_Scan_Command {
-	private const VERSION = '0.3.0';
+	private const VERSION = '0.3.1';
 	private const DB_BATCH_SIZE = 500;
 	private const FILE_CHUNK_SIZE = 524288;
 	private const FILE_CHUNK_OVERLAP = 8192;
@@ -117,6 +117,9 @@ class Security_Scan_Command {
 	 * [--skip-core-checksums]
 	 * : Skip wp core verify-checksums.
 	 *
+	 * [--skip-plugin-reputation]
+	 * : Skip plugin source/repository reputation checks.
+	 *
 	 * [--skip-plugin-checksums]
 	 * : Skip WordPress.org plugin checksum verification.
 	 *
@@ -134,6 +137,7 @@ class Security_Scan_Command {
 	public function __invoke( $args, $assoc_args ) {
 		$sections = [
 			'core',
+			'plugin_reputation',
 			'plugin_checksums',
 			'plugins',
 			'mu_plugins',
@@ -153,7 +157,7 @@ class Security_Scan_Command {
 	 * @when before_wp_load
 	 */
 	public function plugins( $args, $assoc_args ) {
-		$this->run( [ 'plugin_checksums', 'plugins', 'mu_plugins' ], $assoc_args );
+		$this->run( [ 'plugin_reputation', 'plugin_checksums', 'plugins', 'mu_plugins' ], $assoc_args );
 	}
 
 	/**
@@ -232,6 +236,7 @@ class Security_Scan_Command {
 		$this->initialize_plugin_integrity_inventory();
 
 		$skip_core = isset( $assoc_args['skip-core-checksums'] );
+		$skip_plugin_reputation = isset( $assoc_args['skip-plugin-reputation'] );
 		$skip_plugin_checksums = isset( $assoc_args['skip-plugin-checksums'] );
 
 		if ( $this->interactive ) {
@@ -246,6 +251,12 @@ class Security_Scan_Command {
 				case 'core':
 					if ( ! $skip_core ) {
 						$this->scan_core_checksums();
+					}
+					break;
+
+				case 'plugin_reputation':
+					if ( ! $skip_plugin_reputation ) {
+						$this->scan_plugin_reputation();
 					}
 					break;
 
@@ -355,7 +366,7 @@ class Security_Scan_Command {
 	private function load_rules() {
 		$base = dirname( __DIR__ ) . DIRECTORY_SEPARATOR . 'rules';
 
-		foreach ( [ 'iocs', 'php', 'javascript', 'database' ] as $name ) {
+		foreach ( [ 'iocs', 'php', 'javascript', 'database', 'plugin-reputation' ] as $name ) {
 			$path = $base . DIRECTORY_SEPARATOR . $name . '.json';
 			$data = json_decode( (string) file_get_contents( $path ), true );
 
@@ -617,7 +628,6 @@ class Security_Scan_Command {
 				$this->mark_remaining_plugins_verified();
 			}
 
-			$this->scan_verified_plugin_repository_risk();
 			$this->plugin_checksum_stage_finish( $stage );
 		} catch ( \Throwable $e ) {
 			$this->add_finding( $stage, 'low', 45, 'Plugins', 'plugin_checksum_error', 'Plugin checksum verification could not complete: ' . $e->getMessage() );
@@ -651,9 +661,13 @@ class Security_Scan_Command {
 				'name'              => isset( $data['Name'] ) ? (string) $data['Name'] : $slug,
 				'version'           => isset( $data['Version'] ) ? (string) $data['Version'] : '',
 				'file'              => str_replace( '\\', '/', (string) $file ),
+				'update_uri'        => isset( $data['UpdateURI'] ) ? (string) $data['UpdateURI'] : '',
+				'plugin_uri'        => isset( $data['PluginURI'] ) ? (string) $data['PluginURI'] : '',
 				'status'            => 'unverified',
 				'checksum_errors'   => [],
 				'repository_status' => 'unknown',
+				'source'            => 'unknown',
+				'reputation'        => 'unverified',
 			];
 		}
 	}
@@ -702,9 +716,13 @@ class Security_Scan_Command {
 			'name'              => $plugin,
 			'version'           => '',
 			'file'              => is_file( $single_file ) ? $plugin . '.php' : $plugin,
+			'update_uri'        => '',
+			'plugin_uri'        => '',
 			'status'            => 'unverified',
 			'checksum_errors'   => [],
 			'repository_status' => 'unknown',
+			'source'            => 'unknown',
+			'reputation'        => 'unverified',
 		];
 
 		return true;
@@ -811,32 +829,174 @@ class Security_Scan_Command {
 	}
 
 	/**
-	 * Check repository-level risk for verified WordPress.org plugins.
+	 * Evaluate plugin source/repository reputation before checksum verification.
 	 *
-	 * This is deliberately separate from static malware heuristics: a checksum
-	 * match proves local integrity, but a plugin can still be closed/disabled
-	 * upstream and require security review.
+	 * A single WordPress.org update-check request identifies plugins currently
+	 * known to the official directory. Only unresolved plugins require a
+	 * follow-up plugin-information request, which avoids the previous one HTTP
+	 * request per verified plugin bottleneck.
 	 */
-	private function scan_verified_plugin_repository_risk() {
+	private function scan_plugin_reputation() {
+		$stage = 'Plugin reputation';
+		$this->stage_start( $stage );
+
+		$before = $this->count_plugin_reputation_findings();
+		$this->apply_local_plugin_reputation_signals();
+
+		$plugins = $this->get_installed_plugin_data();
+		if ( ! empty( $plugins ) && function_exists( 'wp_remote_post' ) ) {
+			$response = $this->request_wordpress_org_plugin_inventory( $plugins );
+			if ( is_array( $response ) ) {
+				$this->apply_wordpress_org_inventory_response( $response );
+				$this->probe_unresolved_plugin_repository_status();
+			}
+		}
+
+		$findings = max( 0, $this->count_plugin_reputation_findings() - $before );
+		$this->plugin_reputation_stage_finish( $stage, $findings );
+	}
+
+	/**
+	 * Return installed regular plugin data keyed by plugin main file.
+	 */
+	private function get_installed_plugin_data() {
+		if ( ! function_exists( 'get_plugins' ) ) {
+			$plugin_file = defined( 'ABSPATH' ) ? ABSPATH . 'wp-admin/includes/plugin.php' : '';
+			if ( '' !== $plugin_file && is_file( $plugin_file ) ) {
+				require_once $plugin_file;
+			}
+		}
+
+		return function_exists( 'get_plugins' ) ? get_plugins() : [];
+	}
+
+	/**
+	 * Apply high-confidence local reputation signals that need no network call.
+	 */
+	private function apply_local_plugin_reputation_signals() {
+		foreach ( $this->plugin_integrity as $slug => &$data ) {
+			$update_uri = trim( (string) ( $data['update_uri'] ?? '' ) );
+			if ( '' !== $update_uri ) {
+				$host = strtolower( (string) wp_parse_url( $update_uri, PHP_URL_HOST ) );
+				if ( '' !== $host && ! $this->is_wordpress_org_host( $host ) ) {
+					$data['source'] = 'external';
+					$data['repository_status'] = 'external';
+					$data['reputation'] = 'unverified-source';
+				}
+			}
+
+			foreach ( (array) ( $this->rules['plugin-reputation'] ?? [] ) as $rule ) {
+				$slugs = isset( $rule['slugs'] ) && is_array( $rule['slugs'] ) ? $rule['slugs'] : [];
+				if ( ! in_array( $slug, $slugs, true ) ) {
+					continue;
+				}
+
+				$versions = isset( $rule['versions'] ) && is_array( $rule['versions'] ) ? $rule['versions'] : [];
+				if ( ! empty( $versions ) && ! in_array( (string) ( $data['version'] ?? '' ), $versions, true ) ) {
+					continue;
+				}
+
+				$data['reputation'] = 'known-malicious';
+				$this->add_finding(
+					'Plugins',
+					(string) ( $rule['severity'] ?? 'critical' ),
+					(int) ( $rule['confidence'] ?? 99 ),
+					'plugins/' . $slug,
+					(string) ( $rule['id'] ?? 'plugin_reputation_known_malicious' ),
+					(string) ( $rule['description'] ?? 'Known malicious plugin reputation indicator' )
+				);
+			}
+		}
+		unset( $data );
+	}
+
+	/**
+	 * Send one read-only update-check request for the complete plugin inventory.
+	 */
+	private function request_wordpress_org_plugin_inventory( array $plugins ) {
+		$active = function_exists( 'get_option' ) ? (array) get_option( 'active_plugins', [] ) : [];
+		$payload = [
+			'plugins' => $plugins,
+			'active'  => $active,
+		];
+
+		$locales = function_exists( 'get_available_languages' ) ? (array) get_available_languages() : [];
+		if ( function_exists( 'get_locale' ) ) {
+			$locales[] = get_locale();
+		}
+		$locales = array_values( array_unique( array_filter( $locales ) ) );
+
+		$timeout = max( 5, 3 + (int) ( count( $plugins ) / 10 ) );
+		$response = wp_remote_post(
+			'https://api.wordpress.org/plugins/update-check/1.1/',
+			[
+				'timeout'    => $timeout,
+				'body'       => [
+					'plugins'      => wp_json_encode( $payload ),
+					'translations' => wp_json_encode( [] ),
+					'locale'       => wp_json_encode( $locales ),
+					'all'          => wp_json_encode( true ),
+				],
+				'user-agent' => 'WP-CLI Security Scan/' . self::VERSION,
+			]
+		);
+
+		if ( is_wp_error( $response ) || 200 !== (int) wp_remote_retrieve_response_code( $response ) ) {
+			return null;
+		}
+
+		$body = json_decode( (string) wp_remote_retrieve_body( $response ), true );
+		return is_array( $body ) ? $body : null;
+	}
+
+	/**
+	 * Mark plugins returned by the official update API as WordPress.org source.
+	 */
+	private function apply_wordpress_org_inventory_response( array $response ) {
+		$known_files = [];
+		foreach ( [ 'plugins', 'no_update' ] as $bucket ) {
+			if ( empty( $response[ $bucket ] ) || ! is_array( $response[ $bucket ] ) ) {
+				continue;
+			}
+
+			foreach ( $response[ $bucket ] as $plugin_file => $metadata ) {
+				$known_files[] = str_replace( '\\\\', '/', (string) $plugin_file );
+			}
+		}
+
+		foreach ( $known_files as $plugin_file ) {
+			$slug = $this->plugin_slug_from_main_file( $plugin_file );
+			if ( '' === $slug || ! isset( $this->plugin_integrity[ $slug ] ) ) {
+				continue;
+			}
+
+			$this->plugin_integrity[ $slug ]['source'] = 'wordpress.org';
+			$this->plugin_integrity[ $slug ]['repository_status'] = 'available';
+			if ( 'known-malicious' !== $this->plugin_integrity[ $slug ]['reputation'] ) {
+				$this->plugin_integrity[ $slug ]['reputation'] = 'known-source';
+			}
+		}
+	}
+
+	/**
+	 * Probe only unresolved slugs individually for closed/disabled status.
+	 */
+	private function probe_unresolved_plugin_repository_status() {
 		if ( ! function_exists( 'wp_remote_get' ) ) {
 			return;
 		}
 
-		$verified = array_keys(
-			array_filter(
-				$this->plugin_integrity,
-				static function ( $data ) {
-					return isset( $data['status'] ) && 'verified' === $data['status'];
-				}
-			)
-		);
-		$total = count( $verified );
+		$unresolved = [];
+		foreach ( $this->plugin_integrity as $slug => $data ) {
+			if ( 'unknown' === ( $data['repository_status'] ?? 'unknown' ) ) {
+				$unresolved[] = $slug;
+			}
+		}
 
-		foreach ( $verified as $index => $slug ) {
+		$total = count( $unresolved );
+		foreach ( $unresolved as $index => $slug ) {
 			if ( $this->interactive ) {
-				$this->render_spinner(
-					sprintf( 'Checking plugin repository status... %d/%d', $index + 1, $total )
-				);
+				$this->render_spinner( sprintf( 'Checking plugin reputation... %d/%d', $index + 1, $total ) );
 			}
 
 			$url = 'https://api.wordpress.org/plugins/info/1.2/?' . http_build_query(
@@ -845,59 +1005,165 @@ class Security_Scan_Command {
 					'request' => [
 						'slug'   => $slug,
 						'fields' => [
-							'sections' => false,
-							'banners'  => false,
-							'icons'    => false,
+							'sections'        => false,
+							'banners'         => false,
+							'icons'           => false,
+							'active_installs' => false,
 						],
 					],
 				]
 			);
 
-			$response = wp_remote_get( $url, [ 'timeout' => 10 ] );
+			$response = wp_remote_get( $url, [ 'timeout' => 5 ] );
 			if ( is_wp_error( $response ) ) {
 				continue;
 			}
 
+			$code = (int) wp_remote_retrieve_response_code( $response );
 			$body = json_decode( (string) wp_remote_retrieve_body( $response ), true );
-			if ( ! is_array( $body ) || empty( $body['error'] ) ) {
+			$status = $this->classify_plugin_information_response( $code, $body );
+
+			if ( 'available' === $status ) {
+				$this->plugin_integrity[ $slug ]['source'] = 'wordpress.org';
 				$this->plugin_integrity[ $slug ]['repository_status'] = 'available';
+				if ( 'known-malicious' !== $this->plugin_integrity[ $slug ]['reputation'] ) {
+					$this->plugin_integrity[ $slug ]['reputation'] = 'known-source';
+				}
 				continue;
 			}
 
-			$error = strtolower( (string) $body['error'] );
-			if ( ! in_array( $error, [ 'closed', 'disabled' ], true ) ) {
+			if ( in_array( $status, [ 'closed', 'disabled' ], true ) ) {
+				$this->plugin_integrity[ $slug ]['source'] = 'wordpress.org';
+				$this->plugin_integrity[ $slug ]['repository_status'] = $status;
+				$this->plugin_integrity[ $slug ]['reputation'] = 'repository-risk';
+				$this->add_finding(
+					'Plugins',
+					'high',
+					94,
+					'plugins/' . $slug,
+					'plugin_reputation_repository_' . $status,
+					'Plugin is ' . $status . ' on WordPress.org and requires security review'
+				);
 				continue;
 			}
 
-			$this->plugin_integrity[ $slug ]['repository_status'] = $error;
+			if ( 'not-found' === $status ) {
+				$this->plugin_integrity[ $slug ]['source'] = 'unknown';
+				$this->plugin_integrity[ $slug ]['repository_status'] = 'not-found';
+				if ( 'known-malicious' !== $this->plugin_integrity[ $slug ]['reputation'] ) {
+					$this->plugin_integrity[ $slug ]['reputation'] = 'unverified-source';
+				}
+			}
+		}
+	}
+
+	/**
+	 * Classify a WordPress.org plugin-information API response.
+	 */
+	private function classify_plugin_information_response( $http_code, $body ) {
+		if ( is_array( $body ) ) {
+			if ( ! empty( $body['slug'] ) || ! empty( $body['name'] ) ) {
+				return 'available';
+			}
+
 			$context = strtolower(
 				implode(
 					' ',
 					array_filter(
 						[
-							(string) ( $body['reason'] ?? '' ),
-							(string) ( $body['description'] ?? '' ),
+							(string) ( $body['error'] ?? '' ),
+							(string) ( $body['code'] ?? '' ),
 							(string) ( $body['message'] ?? '' ),
-						]
+							(string) ( $body['reason'] ?? '' ),
+						],
 					)
 				)
 			);
-			$security_related = false !== strpos( $context, 'security' );
-			$severity = $security_related ? 'high' : 'medium';
-			$confidence = $security_related ? 94 : 82;
-			$description = $security_related
-				? 'Plugin is closed/disabled on WordPress.org for a security-related reason'
-				: 'Plugin is closed or disabled on WordPress.org and requires review';
-
-			$this->add_finding(
-				'Plugins',
-				$severity,
-				$confidence,
-				'plugins/' . $slug,
-				'plugin_reputation_repository_' . $error,
-				$description
-			);
+			if ( false !== strpos( $context, 'disabled' ) ) {
+				return 'disabled';
+			}
+			if ( false !== strpos( $context, 'closed' ) ) {
+				return 'closed';
+			}
+			if ( false !== strpos( $context, 'not found' ) || false !== strpos( $context, 'not_found' ) ) {
+				return 'not-found';
+			}
 		}
+
+		return 404 === (int) $http_code ? 'not-found' : 'unknown';
+	}
+
+	/**
+	 * Whether a hostname belongs to WordPress.org.
+	 */
+	private function is_wordpress_org_host( $host ) {
+		$host = strtolower( trim( (string) $host, '.' ) );
+		return 'wordpress.org' === $host || substr( $host, -14 ) === '.wordpress.org';
+	}
+
+	/**
+	 * Count independent plugin reputation findings.
+	 */
+	private function count_plugin_reputation_findings() {
+		$count = 0;
+		foreach ( $this->findings as $finding ) {
+			if ( 0 === strpos( (string) ( $finding['rule'] ?? '' ), 'plugin_reputation_' ) ) {
+				$count++;
+			}
+		}
+		return $count;
+	}
+
+	/**
+	 * Finish plugin reputation with source-status counts.
+	 */
+	private function plugin_reputation_stage_finish( $stage, $findings ) {
+		$counts = [
+			'wordpress.org' => 0,
+			'external'      => 0,
+			'unknown'       => 0,
+			'risky'         => 0,
+		];
+
+		foreach ( $this->plugin_integrity as $data ) {
+			$source = (string) ( $data['source'] ?? 'unknown' );
+			if ( isset( $counts[ $source ] ) ) {
+				$counts[ $source ]++;
+			} else {
+				$counts['unknown']++;
+			}
+			if ( in_array( (string) ( $data['reputation'] ?? '' ), [ 'repository-risk', 'known-malicious' ], true ) ) {
+				$counts['risky']++;
+			}
+		}
+
+		if ( isset( $this->stage_stats[ $stage ] ) ) {
+			$this->stage_stats[ $stage ]['items'] = count( $this->plugin_integrity );
+			$this->stage_stats[ $stage ]['findings'] = $findings;
+			$this->stage_stats[ $stage ]['wordpress_org_plugins'] = $counts['wordpress.org'];
+			$this->stage_stats[ $stage ]['external_plugins'] = $counts['external'];
+			$this->stage_stats[ $stage ]['unknown_plugins'] = $counts['unknown'];
+			$this->stage_stats[ $stage ]['risky_plugins'] = $counts['risky'];
+		}
+
+		if ( ! $this->interactive ) {
+			return;
+		}
+
+		$this->clear_spinner();
+		$summary = sprintf(
+			'%d WordPress.org, %d external, %d unknown',
+			$counts['wordpress.org'],
+			$counts['external'],
+			$counts['unknown']
+		);
+
+		if ( $findings > 0 || $counts['risky'] > 0 ) {
+			\WP_CLI::log( '⚠ Plugin reputation checked — ' . $summary . ', ' . max( $findings, $counts['risky'] ) . ' risk signal' . ( 1 === max( $findings, $counts['risky'] ) ? '' : 's' ) . ' found' );
+			return;
+		}
+
+		\WP_CLI::log( '✓ Plugin reputation checked — ' . $summary . ', no reputation warnings found' );
 	}
 
 	/**
@@ -2485,6 +2751,20 @@ PHP;
 			: 'unverified';
 	}
 
+
+	/**
+	 * Return the detected plugin source classification.
+	 */
+	private function plugin_source_status( $plugin ) {
+		if ( null === $plugin || '' === $plugin || ! isset( $this->plugin_integrity[ $plugin ] ) ) {
+			return 'unknown';
+		}
+
+		return isset( $this->plugin_integrity[ $plugin ]['source'] )
+			? (string) $this->plugin_integrity[ $plugin ]['source']
+			: 'unknown';
+	}
+
 	/**
 	 * Strong findings that remain meaningful even when local checksums match.
 	 */
@@ -2546,6 +2826,7 @@ PHP;
 					'highest'    => 'info',
 					'issues'     => [],
 					'integrity'  => $this->plugin_integrity_status( $plugin ),
+					'source'     => $this->plugin_source_status( $plugin ),
 					'risk_score' => 0,
 					'action'     => 'review',
 				];
@@ -2718,6 +2999,9 @@ PHP;
 				)
 			);
 
+			$source_label = 'wordpress.org' === $group['source'] ? 'WordPress.org' : ucfirst( $group['source'] );
+			\WP_CLI::log( '  Source: ' . $source_label );
+
 			if ( 'verified' === $group['integrity'] ) {
 				\WP_CLI::log( '  ✓ Checksums verified — only independent plugin-risk signals are shown.' );
 				\WP_CLI::log( '  ⚠ Recommendation: review the plugin status/source; reinstalling the same verified version may not change these findings.' );
@@ -2769,6 +3053,9 @@ PHP;
 			$summary = $this->plugin_severity_summary( $group );
 			$lines[] = $group['total'] . ' finding' . ( 1 === $group['total'] ? '' : 's' ) . ( '' !== $summary ? ' — ' . $summary : '' ) . '.';
 			$lines[] = '';
+
+			$source_label = 'wordpress.org' === $group['source'] ? 'WordPress.org' : ucfirst( $group['source'] );
+			$lines[] = '- Source: **' . $this->markdown_escape( $source_label ) . '**.';
 
 			if ( 'verified' === $group['integrity'] ) {
 				$lines[] = '- ✓ Checksums verified; ordinary static findings are suppressed.';
