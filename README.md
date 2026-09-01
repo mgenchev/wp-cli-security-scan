@@ -182,6 +182,18 @@ wp security-scan --include-node-modules
 
 Composer `vendor` directories are **not** skipped because their PHP code can be part of the production runtime. `.drone-backups` directories are ignored as internal backup/tooling data.
 
+
+## Users & persistence
+
+The users stage also treats recent account creation as an incident-review signal:
+
+- every account created within the last 2 months is reported as `HIGH`;
+- 5 or more accounts created within a 10-minute window are reported as `CRITICAL`;
+- for privileged accounts, 2 or more created within the same 10-minute window are enough for `CRITICAL`;
+- users in a rapid-registration cluster are shown only once at the higher `CRITICAL` severity.
+
+User findings include the user ID, login, email, role(s), and UTC registration timestamp. Burst detection is limited to the same 2-month incident window so historical imports and migrations do not dominate the report. Cron persistence scanning continues to run in the same stage.
+
 ## Database scanning
 
 The scanner checks common WordPress content/meta tables in batches, including:

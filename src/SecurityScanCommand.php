@@ -10,13 +10,17 @@ if ( ! defined( 'WP_CLI' ) || ! WP_CLI ) {
 }
 
 class Security_Scan_Command {
-	private const VERSION = '0.2.1';
+	private const VERSION = '0.2.2';
 	private const DB_BATCH_SIZE = 500;
 	private const FILE_CHUNK_SIZE = 524288;
 	private const FILE_CHUNK_OVERLAP = 8192;
 	private const DEEP_PHP_WHOLE_FILE_MAX = 8388608;
 	private const DEEP_PHP_CHUNK_SIZE = 2097152;
 	private const DEEP_PHP_CHUNK_OVERLAP = 65536;
+	private const RECENT_USER_MONTHS = 2;
+	private const USER_BURST_WINDOW_SECONDS = 600;
+	private const USER_BURST_THRESHOLD = 5;
+	private const PRIVILEGED_USER_BURST_THRESHOLD = 2;
 
 	private const SEVERITY_WEIGHT = [
 		'critical' => 4,
@@ -1463,9 +1467,11 @@ class Security_Scan_Command {
 	}
 
 	/**
-	 * Scan administrator accounts and cron persistence data.
+	 * Scan user accounts and cron persistence data.
 	 */
 	private function scan_users_and_persistence() {
+		global $wpdb;
+
 		$stage = 'Users & persistence';
 		$this->stage_start( $stage );
 		$count = 0;
@@ -1473,12 +1479,42 @@ class Security_Scan_Command {
 		$admins = get_users(
 			[
 				'role'   => 'administrator',
-				'fields' => [ 'ID', 'user_login', 'user_email' ],
+				'fields' => [ 'ID' ],
 			]
 		);
 		$this->admin_count = count( $admins );
-		$count += $this->admin_count;
+
+		$user_rows = $wpdb->get_results(
+			"SELECT ID, user_login, user_email, user_registered FROM {$wpdb->users} WHERE user_registered IS NOT NULL AND user_registered <> '0000-00-00 00:00:00' ORDER BY user_registered ASC"
+		);
+
+		$users = [];
+		if ( is_array( $user_rows ) ) {
+			foreach ( $user_rows as $row ) {
+				$timestamp = strtotime( $row->user_registered . ' UTC' );
+				if ( false === $timestamp ) {
+					continue;
+				}
+
+				$user = get_userdata( (int) $row->ID );
+				$roles = $user && is_array( $user->roles ) ? array_values( $user->roles ) : [];
+				$is_privileged = $user && ( user_can( $user, 'manage_options' ) || user_can( $user, 'edit_others_posts' ) || user_can( $user, 'manage_woocommerce' ) );
+
+				$users[] = [
+					'id'            => (int) $row->ID,
+					'login'         => (string) $row->user_login,
+					'email'         => (string) $row->user_email,
+					'registered'    => (string) $row->user_registered,
+					'timestamp'     => $timestamp,
+					'roles'         => $roles,
+					'is_privileged' => (bool) $is_privileged,
+				];
+			}
+		}
+
+		$count += count( $users );
 		$this->stage_tick( $stage, $count, 'items' );
+		$this->scan_recent_and_burst_users( $stage, $users );
 
 		$cron = get_option( 'cron', [] );
 		if ( is_array( $cron ) ) {
@@ -1498,6 +1534,133 @@ class Security_Scan_Command {
 		}
 
 		$this->stage_finish( $stage, $count, $this->count_stage_findings( $stage ), 'items' );
+	}
+
+	/**
+	 * Flag recently created users and rapid-registration clusters.
+	 *
+	 * Burst analysis is intentionally limited to the same recent-user window so
+	 * historical imports/migrations do not dominate an incident report.
+	 */
+	private function scan_recent_and_burst_users( $stage, array $users ) {
+		$recent_cutoff = strtotime( '-' . self::RECENT_USER_MONTHS . ' months', time() );
+		$recent_users = array_values(
+			array_filter(
+				$users,
+				static function ( $user ) use ( $recent_cutoff ) {
+					return $user['timestamp'] >= $recent_cutoff;
+				}
+			)
+		);
+
+		if ( empty( $recent_users ) ) {
+			return;
+		}
+
+		$burst_members = $this->find_user_burst_members( $recent_users );
+
+		foreach ( $recent_users as $user ) {
+			$location = $this->format_user_location( $user );
+
+			if ( isset( $burst_members[ $user['id'] ] ) ) {
+				$burst = $burst_members[ $user['id'] ];
+				$description = $burst['privileged']
+					? sprintf( 'Privileged user belongs to a rapid-registration cluster (%d privileged accounts within 10 minutes)', $burst['count'] )
+					: sprintf( 'User belongs to a rapid-registration cluster (%d accounts within 10 minutes)', $burst['count'] );
+
+				$this->add_finding(
+					$stage,
+					'critical',
+					96,
+					$location,
+					'rapid_user_registration',
+					$description
+				);
+				continue;
+			}
+
+			$this->add_finding(
+				$stage,
+				'high',
+				88,
+				$location,
+				'recent_user_account',
+				'User account was created within the last 2 months'
+			);
+		}
+	}
+
+	/**
+	 * Return users that participate in suspicious rapid-registration windows.
+	 *
+	 * Any 5+ accounts within ten minutes are critical. For privileged users,
+	 * two accounts in the same ten-minute window are enough to trigger.
+	 */
+	private function find_user_burst_members( array $users ) {
+		$members = [];
+		$this->mark_user_burst_members( $users, self::USER_BURST_THRESHOLD, false, $members );
+
+		$privileged = array_values(
+			array_filter(
+				$users,
+				static function ( $user ) {
+					return ! empty( $user['is_privileged'] );
+				}
+			)
+		);
+		$this->mark_user_burst_members( $privileged, self::PRIVILEGED_USER_BURST_THRESHOLD, true, $members );
+
+		return $members;
+	}
+
+	/**
+	 * Mark all users that fall inside a sliding burst-registration window.
+	 */
+	private function mark_user_burst_members( array $users, $threshold, $privileged, array &$members ) {
+		$total = count( $users );
+		for ( $start = 0; $start < $total; $start++ ) {
+			$end = $start;
+			while (
+				$end + 1 < $total
+				&& $users[ $end + 1 ]['timestamp'] - $users[ $start ]['timestamp'] <= self::USER_BURST_WINDOW_SECONDS
+			) {
+				$end++;
+			}
+
+			$count = $end - $start + 1;
+			if ( $count < $threshold ) {
+				continue;
+			}
+
+			for ( $index = $start; $index <= $end; $index++ ) {
+				$user_id = $users[ $index ]['id'];
+				$current = $members[ $user_id ] ?? null;
+
+				if ( null === $current || $privileged || $count > $current['count'] ) {
+					$members[ $user_id ] = [
+						'count'      => $count,
+						'privileged' => (bool) $privileged,
+					];
+				}
+			}
+		}
+	}
+
+	/**
+	 * Format a user finding location for quick manual review.
+	 */
+	private function format_user_location( array $user ) {
+		$roles = empty( $user['roles'] ) ? 'none' : implode( ',', $user['roles'] );
+
+		return sprintf(
+			'user #%d · %s · %s · role%s: %s · registered %s UTC',
+			$user['id'],
+			$user['login'],
+			$user['email'],
+			1 === count( $user['roles'] ) ? '' : 's',
+			$roles,
+			$user['registered']
+		);
 	}
 
 	/**

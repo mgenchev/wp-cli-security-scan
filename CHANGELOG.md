@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.2.2] - 2026-09-01
+
+### Added
+
+- Added recent-user incident checks in `Users & persistence`: every account created within the last two months is reported as `HIGH`.
+- Added rapid-registration detection: 5+ accounts created within ten minutes are reported as `CRITICAL`; for privileged accounts, 2+ in the same window are enough.
+- User findings include ID, login, email, roles and registration time for faster manual review.
+- Added a standalone burst-detection smoke test.
+
+### Changed
+
+- Users participating in a rapid-registration cluster are reported only at `CRITICAL`, avoiding duplicate `HIGH` recent-user findings.
+- Users & persistence stage item counts now include scanned user accounts plus cron hooks instead of only administrator accounts plus cron hooks.
+
 ## [0.2.1] - 2026-09-01
 
 ### Changed
