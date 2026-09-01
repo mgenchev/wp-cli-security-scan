@@ -10,10 +10,13 @@ if ( ! defined( 'WP_CLI' ) || ! WP_CLI ) {
 }
 
 class Security_Scan_Command {
-	private const VERSION = '0.1.8';
+	private const VERSION = '0.2.0';
 	private const DB_BATCH_SIZE = 500;
 	private const FILE_CHUNK_SIZE = 524288;
 	private const FILE_CHUNK_OVERLAP = 8192;
+	private const DEEP_PHP_WHOLE_FILE_MAX = 8388608;
+	private const DEEP_PHP_CHUNK_SIZE = 2097152;
+	private const DEEP_PHP_CHUNK_OVERLAP = 65536;
 
 	private const SEVERITY_WEIGHT = [
 		'critical' => 4,
@@ -70,6 +73,7 @@ class Security_Scan_Command {
 	private $modification_clusters = [];
 	private $include_node_modules = false;
 	private $background_spinner_process = null;
+	private $php_data_flow_analyzer = null;
 
 	/**
 	 * Run a complete security scan.
@@ -288,6 +292,7 @@ class Security_Scan_Command {
 		$this->admin_count = 0;
 		$this->modification_clusters = [];
 		$this->include_node_modules = false;
+		$this->php_data_flow_analyzer = null;
 	}
 
 	/**
@@ -322,6 +327,15 @@ class Security_Scan_Command {
 
 			$this->rules[ $name ] = $data['rules'];
 		}
+
+		$ioc_needles = [];
+		foreach ( $this->rules['iocs'] as $rule ) {
+			if ( isset( $rule['needle'] ) && '' !== trim( (string) $rule['needle'] ) ) {
+				$ioc_needles[] = (string) $rule['needle'];
+			}
+		}
+
+		$this->php_data_flow_analyzer = new Security_Scan_Php_Data_Flow_Analyzer( $ioc_needles );
 	}
 
 	/**
@@ -735,6 +749,10 @@ class Security_Scan_Command {
 
 		$this->scan_filename_and_location( $stage, $path, $relative, $extension, $is_uploads, $seen );
 
+		if ( in_array( $extension, self::PHP_EXTENSIONS, true ) ) {
+			$this->scan_php_data_flow_file( $stage, $path, $relative, $seen );
+		}
+
 		$handle = @fopen( $path, 'rb' );
 		if ( false === $handle ) {
 			$this->add_finding( $stage, 'low', 45, $relative, 'file_unreadable', 'File could not be read during the scan' );
@@ -846,6 +864,11 @@ class Security_Scan_Command {
 
 		if ( $is_php_extension || $has_embedded_php ) {
 			$php_scan_buffer = null !== $php_buffer ? $php_buffer : $buffer;
+
+			if ( $has_embedded_php ) {
+				$this->scan_php_data_flow_buffer( $stage, $relative, $php_scan_buffer, $seen, $php_buffer_start_line );
+			}
+
 			foreach ( $this->rules['php'] as $rule ) {
 				$matches = [];
 				if ( 1 === @preg_match( $rule['regex'], $php_scan_buffer, $matches, PREG_OFFSET_CAPTURE ) ) {
@@ -864,6 +887,104 @@ class Security_Scan_Command {
 				if ( 1 === @preg_match( $rule['regex'], $buffer, $matches, PREG_OFFSET_CAPTURE ) ) {
 					$line = $this->line_from_buffer_offset( $buffer, $buffer_start_line, $matches[0][1] );
 					$this->add_file_rule_once( $seen, $stage, $relative, $rule, $line );
+				}
+			}
+		}
+	}
+
+	/**
+	 * Run deeper token/data-flow analysis for a PHP file.
+	 *
+	 * Small/normal files are analyzed as one unit so variable state can be
+	 * followed across the whole file. Very large PHP files are analyzed in
+	 * overlapping windows to keep memory bounded while preserving coverage.
+	 */
+	private function scan_php_data_flow_file( $stage, $path, $relative, array &$seen ) {
+		if ( ! $this->php_data_flow_analyzer instanceof Security_Scan_Php_Data_Flow_Analyzer ) {
+			return;
+		}
+
+		$size = @filesize( $path );
+		if ( false !== $size && $size <= self::DEEP_PHP_WHOLE_FILE_MAX ) {
+			$content = @file_get_contents( $path );
+			if ( is_string( $content ) ) {
+				$this->scan_php_data_flow_buffer( $stage, $relative, $content, $seen, 1 );
+			}
+			return;
+		}
+
+		$handle = @fopen( $path, 'rb' );
+		if ( false === $handle ) {
+			return;
+		}
+
+		$overlap = '';
+		$line_at_chunk_start = 1;
+		while ( ! feof( $handle ) ) {
+			$chunk = fread( $handle, self::DEEP_PHP_CHUNK_SIZE );
+			if ( false === $chunk || '' === $chunk ) {
+				break;
+			}
+
+			$buffer = $overlap . $chunk;
+			$buffer_start_line = max( 1, $line_at_chunk_start - substr_count( $overlap, "\n" ) );
+			$this->scan_php_data_flow_buffer( $stage, $relative, $buffer, $seen, $buffer_start_line );
+			$overlap = substr( $buffer, -self::DEEP_PHP_CHUNK_OVERLAP );
+			$line_at_chunk_start += substr_count( $chunk, "\n" );
+			$this->stage_heartbeat( $stage, 'files' );
+		}
+
+		fclose( $handle );
+	}
+
+	/**
+	 * Apply semantic PHP findings and suppress equivalent regex duplicates.
+	 */
+	private function scan_php_data_flow_buffer( $stage, $relative, $buffer, array &$seen, $base_line ) {
+		if ( ! $this->php_data_flow_analyzer instanceof Security_Scan_Php_Data_Flow_Analyzer ) {
+			return;
+		}
+
+		$aliases = [
+			'dataflow_command_taint'            => [ 'php_command_input' ],
+			'dataflow_obfuscated_command_taint' => [ 'php_command_input', 'php_long_base64_decoder' ],
+			'dataflow_command_payload'          => [ 'php_command_input' ],
+			'dataflow_eval_taint'               => [ 'php_eval_decode', 'php_decoded_variable_execute', 'php_stream_input_execute' ],
+			'dataflow_eval_payload'             => [ 'php_eval_decode', 'php_decoded_variable_execute', 'php_stream_input_execute', 'php_decrypt_execute' ],
+			'dataflow_code_taint'               => [ 'php_assert_input', 'php_dynamic_input_call', 'php_request_callback' ],
+			'dataflow_obfuscated_code_taint'    => [ 'php_assert_input', 'php_dynamic_input_call', 'php_request_callback', 'php_long_base64_decoder' ],
+			'dataflow_code_payload'             => [ 'php_decrypt_execute', 'php_decoded_variable_execute' ],
+			'dataflow_include_taint'            => [ 'php_include_request', 'php_stream_input_execute' ],
+			'dataflow_include_remote'           => [ 'php_remote_execute' ],
+			'dataflow_tainted_dynamic_callback' => [ 'php_dynamic_input_call', 'php_request_callback', 'php_variable_variables' ],
+			'dataflow_decoded_dynamic_callback' => [ 'php_dynamic_input_call', 'php_request_callback', 'php_variable_variables', 'php_long_base64_decoder' ],
+			'dataflow_tainted_callback_sink'    => [ 'php_request_callback' ],
+			'dataflow_dangerous_callback_sink'  => [ 'php_request_callback' ],
+			'dataflow_remote_php_write'         => [ 'php_remote_write' ],
+			'dataflow_tainted_php_write'        => [ 'php_request_file_write' ],
+		];
+
+		foreach ( $this->php_data_flow_analyzer->analyze( $buffer, $base_line ) as $finding ) {
+			$this->add_file_finding_once(
+				$seen,
+				$stage,
+				$finding['severity'],
+				$finding['confidence'],
+				$relative,
+				$finding['rule'],
+				$finding['description'],
+				$finding['line']
+			);
+
+			$alias_rule = $finding['rule'];
+			while ( 0 === strpos( $alias_rule, 'decoded_' ) ) {
+				$alias_rule = substr( $alias_rule, 8 );
+				$seen['php_long_base64_decoder'] = true;
+			}
+
+			if ( isset( $aliases[ $alias_rule ] ) ) {
+				foreach ( $aliases[ $alias_rule ] as $alias ) {
+					$seen[ $alias ] = true;
 				}
 			}
 		}

@@ -36,25 +36,11 @@
             "description": "Deprecated preg_replace /e code execution pattern"
         },
         {
-            "id": "php_remote_write",
-            "regex": "~(?:file_get_contents|curl_exec|fopen|copy)\\s*\\([^;]{0,500}https?://[^;]{0,800}(?:file_put_contents|fwrite|copy|rename|move_uploaded_file)~is",
-            "severity": "critical",
-            "confidence": 95,
-            "description": "Remote payload retrieval followed by local file write"
-        },
-        {
             "id": "php_remote_execute",
             "regex": "~(?:file_get_contents|curl_exec|fopen)\\s*\\([^;]{0,500}https?://[^;]{0,800}(?:eval|include|include_once|require|require_once)\\s*\\(?~is",
             "severity": "critical",
             "confidence": 97,
             "description": "Remote content retrieval followed by execution"
-        },
-        {
-            "id": "php_request_file_write",
-            "regex": "~(?:file_put_contents|fwrite)\\s*\\([^;]{0,500}\\$_(?:GET|POST|REQUEST|COOKIE)~is",
-            "severity": "high",
-            "confidence": 93,
-            "description": "Request-controlled filesystem write"
         },
         {
             "id": "php_upload_handler",

@@ -1,5 +1,27 @@
 # Changelog
 
+## [0.2.0] - 2026-09-01
+
+### Added
+
+- Added an original token-based PHP data-flow analyzer using `token_get_all()`; scanned PHP is never executed.
+- Tracks request/cookie taint across variable assignments, array references, decoder chains, and dynamic callbacks.
+- Added simple interprocedural function summaries so untrusted arguments can be followed through named local helper functions into dangerous sinks.
+- Resolves common obfuscated function names built with concatenation, `chr()`, Base64, ROT13, reverse strings, URL decoding, hex, and related transformations.
+- Detects tainted/decoded data reaching command execution, dynamic code execution, include/require, callback executors, and executable PHP file writes.
+- Detects request-controlled array callables and callback abuse through common PHP callback APIs.
+- Detects `extract()` / `parse_str()` request-data symbol-table taint followed by dangerous execution.
+- Recursively inspects safely decodable static payloads without evaluating them.
+- Tags local custom decoder helpers (including hex/XOR/`ord()`/`chr()` loops) so decoded function names can still be followed into dangerous dynamic calls.
+- Added whitespace-steganography behavior detection.
+- Added standalone semantic analyzer smoke tests covering malicious data flows and known benign false-positive cases.
+
+### Changed
+
+- PHP files up to 8 MB receive whole-file semantic analysis; larger PHP files use overlapping 2 MB semantic windows in addition to the existing streaming scan.
+- Semantic findings suppress equivalent regex findings where both engines identify the same behavior.
+- Remote/request-controlled file writes are now judged by destination and data flow; normal remote JSON/cache writes are not treated as malware merely for writing downloaded data.
+
 ## [0.1.8] - 2026-09-01
 
 ### Changed

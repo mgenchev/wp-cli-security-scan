@@ -23,6 +23,7 @@
     },
     "autoload": {
         "files": [
+            "src/PhpDataFlowAnalyzer.php",
             "src/SecurityScanCommand.php"
         ]
     }

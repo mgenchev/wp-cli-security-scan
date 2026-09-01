@@ -32,9 +32,9 @@ Current checks include:
 - request-controlled dynamic function execution and callback invocation;
 - request-controlled `include` / `require` paths;
 - `php://input` payloads passed toward code/command execution;
-- remote payload download + execution/write;
+- remote payload download followed by execution or an executable PHP drop;
 - decoded/decrypted payloads passed to `eval`, `assert`, `include`, or `require`;
-- direct request-controlled file writes;
+- request-controlled/decoded/remote payloads written to executable PHP paths or request-controlled arbitrary paths;
 - heavy `chr()`/hex obfuscation;
 - long obfuscated PHP lines combined with execution primitives;
 - deprecated `preg_replace(... /e ...)` execution;
@@ -54,6 +54,37 @@ Current checks include:
 - suspicious cron payloads;
 
 Rules live in `rules/*.json` so exact indicators and signatures can be expanded without rewriting the scanner engine.
+
+## Deep PHP semantic analysis
+
+Version `0.2.0` adds a second PHP analysis layer based on `token_get_all()`. It does not execute scanned code. Instead, it follows variable state through common malware data-flow patterns and combines that with the existing IOC/regex rules.
+
+The semantic analyzer can follow patterns such as:
+
+- `$_GET` / `$_POST` / `$_REQUEST` / `$_COOKIE` aliases across multiple assignments;
+- request data passed through Base64/gzip/ROT13/URL decoders before execution;
+- dangerous function names assembled with string concatenation, `chr()`, Base64, `strrev()`, and similar transformations;
+- variable functions and request-controlled array elements used as callbacks;
+- indirect execution through `call_user_func()`, callback APIs, `array_*` callback functions, shutdown/error handlers, and similar callback sinks;
+- `extract()` / one-argument `parse_str()` on request data followed by dangerous use of dynamically created variables;
+- request-controlled `include` / `require`;
+- local helper functions where an untrusted argument is forwarded to command execution, dynamic PHP execution, include/require, dangerous callbacks, or executable file writes;
+- `php://input` flowing toward execution;
+- remote payloads flowing into `eval`/command execution or executable PHP files;
+- uploaded/request-controlled payloads written to executable PHP paths;
+- nested statically decodable payloads, including multiple layers of Base64, gzip, ROT13, reverse strings, URL encoding, hex, and UU encoding;
+- custom local decoder helpers, including hex/XOR/`ord()`/`chr()` loops, when their result later becomes a dynamic callback or reaches another dangerous sink;
+- whitespace-to-binary steganography patterns and dense request-controlled callback obfuscation.
+
+The analyzer deliberately does **not** treat normal variable-variable assignment, ordinary callbacks, Base64 decoding, remote API reads, or remote JSON caching as malware by themselves. The goal is to report the dangerous data flow, not merely the presence of a suspicious-looking function.
+
+Small and normal PHP files are analyzed as a complete unit so state can be followed across the file. Very large PHP files use overlapping analysis windows to keep memory bounded while retaining the existing streaming signature scan as a fallback.
+
+Standalone semantic smoke tests can be run with:
+
+```bash
+php tests/data-flow-smoke.php
+```
 
 ## Installation
 
