@@ -1,17 +1,123 @@
 {
     "rules": [
-        {"id":"ioc_e2sky","needle":"e2sky.com","severity":"critical","confidence":99,"description":"Known malicious e2sky indicator"},
-        {"id":"ioc_chhimi","needle":"chhimi","severity":"critical","confidence":99,"description":"Known field IOC from compromised WordPress sites"},
-        {"id":"ioc_filesman","needle":"FilesMan","severity":"critical","confidence":98,"description":"Known web shell fingerprint"},
-        {"id":"ioc_wso","needle":"Web Shell by oRb","severity":"critical","confidence":99,"description":"WSO web shell fingerprint"},
-        {"id":"ioc_b374k","needle":"b374k","severity":"critical","confidence":98,"description":"b374k web shell fingerprint"},
-        {"id":"ioc_r57","needle":"r57shell","severity":"critical","confidence":98,"description":"r57 web shell fingerprint"},
-        {"id":"ioc_c99","needle":"c99shell","severity":"critical","confidence":98,"description":"c99 web shell fingerprint"},
-        {"id":"ioc_indoxploit","needle":"IndoXploit","severity":"critical","confidence":97,"description":"IndoXploit web shell fingerprint"},
-        {"id":"ioc_k4nc1l","needle":"K4NC1L","severity":"critical","confidence":97,"description":"Known web shell fingerprint"},
-        {"id":"ioc_alfa","needle":"ALFA TEaM Shell","severity":"critical","confidence":98,"description":"ALFA web shell fingerprint"},
-        {"id":"ioc_leaf","needle":"Leaf PHPMailer","severity":"high","confidence":94,"description":"Known malicious mailer/web shell fingerprint"},
-        {"id":"ioc_wp_vcd","needle":"wp-vcd","severity":"high","confidence":93,"description":"Known WordPress malware family indicator"},
-        {"id":"ioc_anonymousfox","needle":"AnonymousFox","severity":"critical","confidence":98,"description":"Known malicious toolkit fingerprint"}
+        {
+            "id": "ioc_e2sky",
+            "needle": "e2sky.com",
+            "severity": "critical",
+            "confidence": 99,
+            "description": "Known malicious e2sky indicator"
+        },
+        {
+            "id": "ioc_chhimi",
+            "needle": "chhimi",
+            "severity": "critical",
+            "confidence": 99,
+            "description": "Known field IOC from compromised WordPress sites"
+        },
+        {
+            "id": "ioc_filesman",
+            "needle": "FilesMan",
+            "severity": "critical",
+            "confidence": 98,
+            "description": "Known web shell fingerprint"
+        },
+        {
+            "id": "ioc_wso",
+            "needle": "Web Shell by oRb",
+            "severity": "critical",
+            "confidence": 99,
+            "description": "WSO web shell fingerprint"
+        },
+        {
+            "id": "ioc_b374k",
+            "needle": "b374k",
+            "severity": "critical",
+            "confidence": 98,
+            "description": "b374k web shell fingerprint"
+        },
+        {
+            "id": "ioc_r57",
+            "needle": "r57shell",
+            "severity": "critical",
+            "confidence": 98,
+            "description": "r57 web shell fingerprint"
+        },
+        {
+            "id": "ioc_c99",
+            "needle": "c99shell",
+            "severity": "critical",
+            "confidence": 98,
+            "description": "c99 web shell fingerprint"
+        },
+        {
+            "id": "ioc_indoxploit",
+            "needle": "IndoXploit",
+            "severity": "critical",
+            "confidence": 97,
+            "description": "IndoXploit web shell fingerprint"
+        },
+        {
+            "id": "ioc_k4nc1l",
+            "needle": "K4NC1L",
+            "severity": "critical",
+            "confidence": 97,
+            "description": "Known web shell fingerprint"
+        },
+        {
+            "id": "ioc_alfa",
+            "needle": "ALFA TEaM Shell",
+            "severity": "critical",
+            "confidence": 98,
+            "description": "ALFA web shell fingerprint"
+        },
+        {
+            "id": "ioc_leaf",
+            "needle": "Leaf PHPMailer",
+            "severity": "high",
+            "confidence": 94,
+            "description": "Known malicious mailer/web shell fingerprint"
+        },
+        {
+            "id": "ioc_wp_vcd",
+            "needle": "wp-vcd",
+            "severity": "high",
+            "confidence": 93,
+            "description": "Known WordPress malware family indicator"
+        },
+        {
+            "id": "ioc_anonymousfox",
+            "needle": "AnonymousFox",
+            "severity": "critical",
+            "confidence": 98,
+            "description": "Known malicious toolkit fingerprint"
+        },
+        {
+            "id": "ioc_wpc_ak",
+            "needle": "_wpc_ak",
+            "severity": "critical",
+            "confidence": 99,
+            "description": "Known WordPress backdoor persistence option indicator"
+        },
+        {
+            "id": "ioc_wpjs1",
+            "needle": "wpjs1.com",
+            "severity": "critical",
+            "confidence": 99,
+            "description": "Known WordPress malware command-and-control indicator"
+        },
+        {
+            "id": "ioc_api_sn_cloudserver",
+            "needle": "API_SN_CLOUDSERVER",
+            "severity": "high",
+            "confidence": 96,
+            "description": "Known hidden-plugin command-and-control option indicator"
+        },
+        {
+            "id": "ioc_apx_upx",
+            "needle": "apx=upx",
+            "severity": "high",
+            "confidence": 97,
+            "description": "Known compact WordPress file-uploader trigger indicator"
+        }
     ]
 }

@@ -26,11 +26,14 @@ The scanner combines exact indicators and behavioral heuristics instead of treat
 
 Current checks include:
 
-- known malware and web-shell indicators (`e2sky`, `chhimi`, FilesMan, WSO, b374k, r57, c99, IndoXploit, ALFA, AnonymousFox, and others);
+- known malware and web-shell indicators (`e2sky`, `chhimi`, FilesMan, WSO, b374k, r57, c99, IndoXploit, ALFA, AnonymousFox, current public WordPress campaign IOCs, and others);
 - encoded payload execution (`eval` + Base64/gzip/ROT13/URL decoding);
 - request-controlled command execution;
-- request-controlled dynamic function execution;
+- request-controlled dynamic function execution and callback invocation;
+- request-controlled `include` / `require` paths;
+- `php://input` payloads passed toward code/command execution;
 - remote payload download + execution/write;
+- decoded/decrypted payloads passed to `eval`, `assert`, `include`, or `require`;
 - direct request-controlled file writes;
 - heavy `chr()`/hex obfuscation;
 - long obfuscated PHP lines combined with execution primitives;
@@ -72,7 +75,7 @@ wp package install https://github.com/mgenchev/wp-cli-security-scan.git
 wp security-scan
 ```
 
-The command starts before WordPress is bootstrapped, so terminal runs show immediate feedback even on very large local installations:
+The command starts before WordPress is bootstrapped. The startup indicator runs in a lightweight child process, so it keeps animating even while the main PHP process is blocked loading a very large WordPress installation:
 
 ```text
 ⠋ Security Scan — loading WordPress...
@@ -113,18 +116,18 @@ Plugins
 ------------------------------------------------------------------------
 3 threats found
 
-CRITICAL · 99%  plugins/example/inc/class-loader.php:184
-                Encoded payload executed with eval
+CRITICAL · 99%  Encoded payload executed with eval
+                plugins/example/inc/class-loader.php:184
 
-HIGH · 92%      Plugins
-                File doesn't verify against checksum: example/file.php
+HIGH · 92%      File doesn't verify against checksum: example/file.php
+                Plugins
 
 Uploads
 ------------------------------------------------------------------------
 1 threat found
 
-CRITICAL · 99%  uploads/2024/08/logo.jpg:1
-                PHP code embedded inside a non-PHP upload
+CRITICAL · 99%  PHP code embedded inside a non-PHP upload
+                uploads/2024/08/logo.jpg:1
 ```
 
 File-content findings include the source line when it can be determined, for example `plugins/example/file.php:184`. Filename-only, checksum, symlink, and database findings may not have a line number.
@@ -159,7 +162,11 @@ The scanner checks common WordPress content/meta tables in batches, including:
 
 The actual WordPress table prefix is used automatically.
 
-Patterns include `<script>`, PHP code, `eval()`, `base64_decode()`, gzip decoders, `phpinfo()`, `system()`, `exec()`, `shell_exec()`, `passthru()`, hidden iframes, JavaScript URIs, long encoded payloads, and known IOCs. OS command functions require executable PHP-like context before they are reported as critical. Known WP All Export / WP All Import session payloads are not flagged solely because they contain large Base64 data; decoded content is still checked for strong indicators.
+Patterns include PHP code, `eval()`, `base64_decode()`, gzip decoders, `phpinfo()`, contextual `system()` / `exec()` / `shell_exec()` / `passthru()`, hidden iframes, JavaScript URIs, obfuscated JavaScript behavior, encoded payloads, and known IOCs. A plain `<script>` tag is not treated as malware by itself because WordPress commonly stores legitimate custom scripts in options/meta. Large Base64 values are decoded and inspected; they are reported only when the decoded content contains strong executable/malware indicators.
+
+## Non-executable backup/data files
+
+Raw contents of database dumps, source maps and compressed archives are skipped by the static code scanner (`.sql`, `.dump`, `.zip`, `.gz`, `.tar`, `.7z`, `.rar`, `.map`, etc.). These files can legitimately contain historical malware strings or bundled source text but are not directly executable by WordPress/PHP. Executable files placed beside them are still scanned normally.
 
 ## Severity and confidence
 

@@ -1,5 +1,28 @@
 # Changelog
 
+## [0.1.8] - 2026-09-01
+
+### Changed
+
+- Database dumps, source maps, and compressed archives are no longer raw-content scanned, preventing historical IOC strings inside `.sql`/archive data from being reported as live executable threats.
+- Large Base64 database values are now decoded and inspected instead of being reported merely for their size/encoding.
+- Plain database `<script>` tags are no longer standalone findings; stronger JavaScript behavior rules still detect obfuscated execution, hidden iframes, decoded redirects, and other dangerous patterns.
+- Added stronger PHP behavioral rules for request-controlled includes, `php://input` execution, decoded/decrypted payload execution, and request-controlled callbacks.
+- Added current public WordPress malware campaign indicators and several high-confidence malicious uploader/plugin filename checks.
+
+### Fixed
+
+- Reduced false positives from SQL database dumps containing historical web-shell strings such as `IndoXploit`.
+- Reduced false positives from legitimate plugin configuration such as Admin Menu Editor / other large Base64-encoded settings.
+- Reduced false positives from legitimate header/footer/custom-JavaScript fields stored in WordPress options/meta.
+
+## [0.1.7] - 2026-09-01
+
+### Changed
+
+- WordPress bootstrap feedback now uses an independent background spinner process, so `Security Scan — loading WordPress...` continues animating while the main process is blocked loading WordPress.
+- Removed the leading space before clean `✓` stage/checksum status icons because terminals do not support reliable half-character spacing.
+
 ## [0.1.6] - 2026-09-01
 
 ### Changed

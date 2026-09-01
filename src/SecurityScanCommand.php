@@ -10,7 +10,7 @@ if ( ! defined( 'WP_CLI' ) || ! WP_CLI ) {
 }
 
 class Security_Scan_Command {
-	private const VERSION = '0.1.6';
+	private const VERSION = '0.1.8';
 	private const DB_BATCH_SIZE = 500;
 	private const FILE_CHUNK_SIZE = 524288;
 	private const FILE_CHUNK_OVERLAP = 8192;
@@ -29,6 +29,10 @@ class Security_Scan_Command {
 
 	private const JS_EXTENSIONS = [
 		'js', 'mjs', 'cjs', 'html', 'htm', 'svg',
+	];
+
+	private const NON_EXECUTABLE_DATA_EXTENSIONS = [
+		'sql', 'dump', 'zip', 'gz', 'tgz', 'bz2', 'xz', 'tar', '7z', 'rar', 'map',
 	];
 
 	private const UPLOAD_EXECUTABLE_EXTENSIONS = [
@@ -65,6 +69,7 @@ class Security_Scan_Command {
 	private $admin_count = 0;
 	private $modification_clusters = [];
 	private $include_node_modules = false;
+	private $background_spinner_process = null;
 
 	/**
 	 * Run a complete security scan.
@@ -195,10 +200,14 @@ class Security_Scan_Command {
 		$this->start_time = microtime( true );
 
 		if ( $this->interactive ) {
-			$this->render_spinner( 'Security Scan — loading WordPress...' );
+			$this->start_background_spinner( 'Security Scan — loading WordPress...' );
 		}
 
-		\WP_CLI::get_runner()->load_wordpress();
+		try {
+			\WP_CLI::get_runner()->load_wordpress();
+		} finally {
+			$this->stop_background_spinner();
+		}
 
 		if ( $this->interactive ) {
 			$this->render_spinner( 'Security Scan — preparing rules...' );
@@ -716,6 +725,14 @@ class Security_Scan_Command {
 		$relative = $this->relative_wp_content_path( $path );
 		$seen = [];
 
+		// Database dumps, source maps and compressed archives are not executable
+		// by WordPress/PHP. Scanning their raw bytes creates false positives from
+		// historical malware strings, bundled source text and archive metadata.
+		// Executable files placed alongside them are still scanned normally.
+		if ( in_array( $extension, self::NON_EXECUTABLE_DATA_EXTENSIONS, true ) ) {
+			return;
+		}
+
 		$this->scan_filename_and_location( $stage, $path, $relative, $extension, $is_uploads, $seen );
 
 		$handle = @fopen( $path, 'rb' );
@@ -749,6 +766,17 @@ class Security_Scan_Command {
 	 */
 	private function scan_filename_and_location( $stage, $path, $relative, $extension, $is_uploads, array &$seen ) {
 		$filename = basename( $path );
+		$lower_filename = strtolower( $filename );
+
+		$known_malicious_filenames = [
+			'wp-antymalwary-bot.php' => 'Known malicious fake WordPress plugin filename',
+			'wp-apx-upx.php'        => 'Known malicious compact WordPress file-uploader filename',
+			'wp-apxupx.php'         => 'Known malicious compact WordPress file-uploader filename',
+		];
+
+		if ( isset( $known_malicious_filenames[ $lower_filename ] ) ) {
+			$this->add_file_finding_once( $seen, $stage, 'critical', 98, $relative, 'known_malicious_filename', $known_malicious_filenames[ $lower_filename ] );
+		}
 
 		if ( $is_uploads && in_array( $extension, self::UPLOAD_EXECUTABLE_EXTENSIONS, true ) ) {
 			$this->add_file_finding_once( $seen, $stage, 'high', 96, $relative, 'uploads_executable', 'Executable/script file found inside uploads' );
@@ -934,6 +962,12 @@ class Security_Scan_Command {
 			'gzinflate(',
 			'gzuncompress(',
 			'str_rot13(',
+			'strrev(',
+			'str_repeat(',
+			'chr(',
+			'openssl_decrypt(',
+			'php://input',
+			'call_user_func(',
 			'shell_exec(',
 			'passthru(',
 			'proc_open(',
@@ -1133,6 +1167,25 @@ class Security_Scan_Command {
 			$seen[ $key ] = true;
 			$this->add_finding( $stage, $rule['severity'], $rule['confidence'], $location, $rule['id'], $rule['description'] );
 		}
+
+		// A <script> tag is normal in many WordPress settings and custom-code
+		// fields. Only report JavaScript when it matches a stronger behavioral
+		// rule such as obfuscated execution, hidden iframe or decoded redirect.
+		if ( preg_match( '~(?:<script\b|<iframe\b|\beval\s*\(|\batob\s*\(|fromCharCode|javascript\s*:|location\.)~i', $value ) ) {
+			foreach ( $this->rules['javascript'] as $rule ) {
+				if ( ! @preg_match( $rule['regex'], $value ) ) {
+					continue;
+				}
+
+				$key = 'db_' . $rule['id'];
+				if ( isset( $seen[ $key ] ) ) {
+					continue;
+				}
+
+				$seen[ $key ] = true;
+				$this->add_finding( $stage, $rule['severity'], $rule['confidence'], $location, $key, $rule['description'] );
+			}
+		}
 	}
 
 	/**
@@ -1149,6 +1202,10 @@ class Security_Scan_Command {
 
 		if ( 'db_long_base64' === $rule['id'] ) {
 			return $this->should_report_database_base64( $value, $table, $row, $field );
+		}
+
+		if ( 'db_script' === $rule['id'] ) {
+			return false;
 		}
 
 		return true;
@@ -1182,13 +1239,6 @@ class Security_Scan_Command {
 	 * their decoded content for executable indicators.
 	 */
 	private function should_report_database_base64( $value, $table, array $row, $field ) {
-		$option_name = isset( $row['option_name'] ) ? (string) $row['option_name'] : '';
-		$is_known_session = '' !== $option_name && preg_match( '~^_(?:wpallexport|wpallimport)_session_~i', $option_name );
-
-		if ( ! $is_known_session ) {
-			return true;
-		}
-
 		if ( ! preg_match_all( '~[A-Za-z0-9+/]{800,}={0,2}~', $value, $matches ) ) {
 			return false;
 		}
@@ -1204,6 +1254,10 @@ class Security_Scan_Command {
 			}
 		}
 
+		// Large Base64 values are common in plugin configuration, sessions and
+		// serialized settings. By themselves they are not executable. Malicious
+		// decoded content is still caught above and loader/decryptor code is
+		// detected by the filesystem scanner.
 		return false;
 	}
 
@@ -1398,7 +1452,7 @@ class Security_Scan_Command {
 		}
 
 		$this->clear_spinner();
-		$icon = 0 === $findings ? ' ✓' : '⚠';
+		$icon = 0 === $findings ? '✓' : '⚠';
 		$suffix = 0 === $findings ? 'no threats found' : sprintf( '%d threat%s found', $findings, 1 === $findings ? '' : 's' );
 		\WP_CLI::log( sprintf( '%s %s scanned — %s %s, %s', $icon, $stage, number_format( $count ), $unit, $suffix ) );
 	}
@@ -1419,7 +1473,7 @@ class Security_Scan_Command {
 		$this->clear_spinner();
 
 		if ( 0 === $findings ) {
-			\WP_CLI::log( sprintf( ' ✓ %s completed — no integrity issues found', $stage ) );
+			\WP_CLI::log( sprintf( '✓ %s completed — no integrity issues found', $stage ) );
 			return;
 		}
 
@@ -1431,6 +1485,90 @@ class Security_Scan_Command {
 				1 === $findings ? '' : 's'
 			)
 		);
+	}
+
+	/**
+	 * Start a spinner in a lightweight child PHP process.
+	 *
+	 * This keeps animation moving while the parent process is blocked by
+	 * WordPress bootstrap or another synchronous operation.
+	 */
+	private function start_background_spinner( $message ) {
+		if ( ! $this->interactive ) {
+			return;
+		}
+
+		$this->stop_background_spinner();
+
+		if ( ! function_exists( 'proc_open' ) || ! defined( 'PHP_BINARY' ) || '' === PHP_BINARY ) {
+			$this->render_spinner( $message );
+			return;
+		}
+
+		$encoded_message = base64_encode( $message );
+		$code = <<<'PHP'
+$frames = [ '⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏' ];
+$message = base64_decode( '__MESSAGE__' );
+$index = 0;
+
+while ( true ) {
+	fwrite( STDOUT, "\r\033[2K" . $frames[ $index % count( $frames ) ] . ' ' . $message );
+	fflush( STDOUT );
+	$index++;
+	usleep( 100000 );
+}
+PHP;
+		$code = str_replace( '__MESSAGE__', $encoded_message, $code );
+
+		$descriptors = [
+			0 => [ 'pipe', 'r' ],
+			1 => STDOUT,
+			2 => STDERR,
+		];
+
+		$pipes = [];
+		$process = @proc_open(
+			[ PHP_BINARY, '-r', $code ],
+			$descriptors,
+			$pipes,
+			null,
+			null,
+			[ 'bypass_shell' => true ]
+		);
+
+		if ( ! is_resource( $process ) ) {
+			$this->render_spinner( $message );
+			return;
+		}
+
+		if ( isset( $pipes[0] ) && is_resource( $pipes[0] ) ) {
+			fclose( $pipes[0] );
+		}
+
+		$this->background_spinner_process = $process;
+	}
+
+	/**
+	 * Stop and clear the background spinner.
+	 */
+	private function stop_background_spinner() {
+		if ( is_resource( $this->background_spinner_process ) ) {
+			$status = @proc_get_status( $this->background_spinner_process );
+
+			if ( is_array( $status ) && ! empty( $status['running'] ) ) {
+				@proc_terminate( $this->background_spinner_process );
+				usleep( 20000 );
+			}
+
+			@proc_close( $this->background_spinner_process );
+		}
+
+		$this->background_spinner_process = null;
+
+		if ( $this->interactive ) {
+			fwrite( STDOUT, "\r\033[2K" );
+			@fflush( STDOUT );
+		}
 	}
 
 	/**
@@ -1637,7 +1775,7 @@ class Security_Scan_Command {
 				continue;
 			}
 
-			$icon = 0 === $findings ? ' ✓' : '⚠';
+			$icon = 0 === $findings ? '✓' : '⚠';
 			if ( 'Checksums' === $label ) {
 				$status = 0 === $findings
 					? 'no integrity issues'
