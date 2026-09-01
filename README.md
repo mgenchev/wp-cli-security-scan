@@ -20,6 +20,8 @@ A full scan runs in separate stages:
 
 The scanner is **read-only**. It does not remove, quarantine, edit, or repair files or database records.
 
+During the scan process, `WP_DEBUG`, `WP_DEBUG_DISPLAY`, and `WP_DEBUG_LOG` are forced off in memory before WordPress is loaded. The package does not edit `wp-config.php`; the change applies only to the current WP-CLI process.
+
 ## Detection layers
 
 The scanner combines exact indicators and behavioral heuristics instead of treating a single function such as `base64_decode()` as proof of malware.
@@ -35,7 +37,7 @@ Current checks include:
 - remote payload download followed by execution or an executable PHP drop;
 - decoded/decrypted payloads passed to `eval`, `assert`, `include`, or `require`;
 - request-controlled/decoded/remote payloads written to executable PHP paths or request-controlled arbitrary paths;
-- heavy `chr()`/hex obfuscation;
+- heavy `chr()` obfuscation and hexadecimal payloads when combined with execution context;
 - long obfuscated PHP lines combined with execution primitives;
 - deprecated `preg_replace(... /e ...)` execution;
 - suspicious administrator creation/promotion code;
@@ -77,6 +79,8 @@ The semantic analyzer can follow patterns such as:
 - whitespace-to-binary steganography patterns and dense request-controlled callback obfuscation.
 
 The analyzer deliberately does **not** treat normal variable-variable assignment, ordinary callbacks, Base64 decoding, remote API reads, or remote JSON caching as malware by themselves. The goal is to report the dangerous data flow, not merely the presence of a suspicious-looking function.
+
+Broad standalone regex checks for `php://input`, `openssl_decrypt()`, `move_uploaded_file()`, and long hexadecimal strings are intentionally avoided where the semantic analyzer can prove the actual data flow. This keeps strong detection while reducing false positives from payment gateways, cryptography libraries, upload interfaces, and documentation/template files.
 
 Small and normal PHP files are analyzed as a complete unit so state can be followed across the file. Very large PHP files use overlapping analysis windows to keep memory bounded while retaining the existing streaming signature scan as a fallback.
 

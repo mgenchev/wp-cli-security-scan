@@ -125,6 +125,34 @@ $callback( $_POST['payload'] );
 CODE,
 		'expect' => 'dataflow_decoded_dynamic_callback',
 	],
+
+	[
+		'name' => 'raw request body reaches eval',
+		'code' => <<<'CODE'
+<?php
+$payload = file_get_contents( 'php://input' );
+eval( $payload );
+CODE,
+		'expect' => 'dataflow_eval_taint',
+	],
+	[
+		'name' => 'decrypted payload reaches eval',
+		'code' => <<<'CODE'
+<?php
+$payload = openssl_decrypt( $encrypted, 'aes-256-cbc', $key );
+eval( $payload );
+CODE,
+		'expect' => 'dataflow_eval_payload',
+	],
+	[
+		'name' => 'uploaded request data written to PHP',
+		'code' => <<<'CODE'
+<?php
+$target = __DIR__ . '/cache/shell.php';
+move_uploaded_file( $_FILES['payload']['tmp_name'], $target );
+CODE,
+		'expect' => 'dataflow_tainted_php_write',
+	],
 	[
 		'name' => 'legitimate variable-variable assignment',
 		'code' => <<<'CODE'

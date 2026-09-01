@@ -43,13 +43,6 @@
             "description": "Remote content retrieval followed by execution"
         },
         {
-            "id": "php_upload_handler",
-            "regex": "~move_uploaded_file\\s*\\([^;]{0,500}\\$_FILES~is",
-            "severity": "medium",
-            "confidence": 62,
-            "description": "Direct file upload handler requires review"
-        },
-        {
             "id": "php_long_base64_decoder",
             "regex": "~(?:base64_decode|gzinflate|gzuncompress)\\s*\\(\\s*[\\'\"][A-Za-z0-9+/=]{400,}[\\'\"]~is",
             "severity": "critical",
@@ -62,13 +55,6 @@
             "severity": "high",
             "confidence": 89,
             "description": "Heavy chr() string obfuscation"
-        },
-        {
-            "id": "php_hex_obfuscation",
-            "regex": "~(?:\\\\x[0-9a-fA-F]{2}){16,}~",
-            "severity": "high",
-            "confidence": 86,
-            "description": "Long hexadecimal escaped payload"
         },
         {
             "id": "php_variable_variables",
@@ -99,13 +85,6 @@
             "description": "Request-controlled file inclusion"
         },
         {
-            "id": "php_stream_input_execute",
-            "regex": "~(?:file_get_contents\\s*\\(\\s*['\\\"]php://input|fopen\\s*\\(\\s*['\\\"]php://input)[\\s\\S]{0,1200}(?:eval|assert|system|exec|shell_exec|passthru|include|require)\\s*\\(?~i",
-            "severity": "critical",
-            "confidence": 98,
-            "description": "Raw request body is passed toward code or command execution"
-        },
-        {
             "id": "php_decoded_variable_execute",
             "regex": "~\\$([A-Za-z_][A-Za-z0-9_]*)\\s*=\\s*(?:base64_decode|gzinflate|gzuncompress|str_rot13|rawurldecode|urldecode|openssl_decrypt)\\s*\\([^;]+;[\\s\\S]{0,1000}(?:eval|assert)\\s*\\(\\s*\\$\\1\\s*\\)~i",
             "severity": "critical",
@@ -120,11 +99,11 @@
             "description": "Request input controls a dynamic callback"
         },
         {
-            "id": "php_decrypt_execute",
-            "regex": "~openssl_decrypt\\s*\\([\\s\\S]{0,1000}(?:eval|assert|include|require)\\s*\\(?~i",
+            "id": "php_hex_obfuscation_execution",
+            "regex": "~(?:(?:eval|assert|call_user_func|call_user_func_array)\\s*\\([^;]{0,800}(?:\\\\x[0-9a-fA-F]{2}){16,}|(?:\\\\x[0-9a-fA-F]{2}){16,}[\\s\\S]{0,800}(?:eval|assert|call_user_func|call_user_func_array)\\s*\\()~is",
             "severity": "high",
-            "confidence": 94,
-            "description": "Decrypted payload is passed toward dynamic execution"
+            "confidence": 92,
+            "description": "Long hexadecimal payload occurs next to dynamic code execution"
         }
     ]
 }

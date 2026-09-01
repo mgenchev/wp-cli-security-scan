@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.2.1] - 2026-09-01
+
+### Changed
+
+- WordPress debug display/logging is disabled in memory for the duration of the scan without modifying `wp-config.php`.
+- Removed broad standalone `php://input`, decrypted-payload, and generic upload-handler regex findings where the semantic data-flow analyzer already verifies the dangerous flow.
+- Hexadecimal PHP payloads now require nearby dynamic execution context instead of being treated as malicious solely for containing long `\xNN` sequences.
+- PHP density heuristics now require execution + obfuscation + untrusted-input signals together, reducing false positives in legitimate libraries while preserving stronger semantic findings.
+- Documentation/JavaScript/CSS files no longer receive a generic critical finding merely for containing a valid PHP example/template block; embedded PHP is still semantically scanned for dangerous behavior. PHP embedded in uploads and image/binary-style files remains reportable.
+
+### Tests
+
+- Added regression tests for benign raw-body parsing, normal OpenSSL decryption, PSR upload interfaces, legitimate hexadecimal constants, embedded PHP examples, and malicious equivalents.
+
 ## [0.2.0] - 2026-09-01
 
 ### Added

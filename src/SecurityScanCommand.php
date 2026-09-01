@@ -10,7 +10,7 @@ if ( ! defined( 'WP_CLI' ) || ! WP_CLI ) {
 }
 
 class Security_Scan_Command {
-	private const VERSION = '0.2.0';
+	private const VERSION = '0.2.1';
 	private const DB_BATCH_SIZE = 500;
 	private const FILE_CHUNK_SIZE = 524288;
 	private const FILE_CHUNK_OVERLAP = 8192;
@@ -44,6 +44,10 @@ class Security_Scan_Command {
 
 	private const NON_PHP_MEDIA_EXTENSIONS = [
 		'jpg', 'jpeg', 'png', 'gif', 'webp', 'avif', 'svg', 'ico', 'bmp', 'tif', 'tiff', 'pdf', 'txt', 'dat', 'log', 'css', 'js',
+	];
+
+	private const NON_EXECUTABLE_TEMPLATE_EXTENSIONS = [
+		'txt', 'js', 'css',
 	];
 
 	private const DROPIN_FILES = [
@@ -201,6 +205,7 @@ class Security_Scan_Command {
 		$this->reset_state();
 		$this->configure_output( $assoc_args );
 		$this->include_node_modules = isset( $assoc_args['include-node-modules'] );
+		$this->suppress_wordpress_debug();
 		$this->start_time = microtime( true );
 
 		if ( $this->interactive ) {
@@ -293,6 +298,31 @@ class Security_Scan_Command {
 		$this->modification_clusters = [];
 		$this->include_node_modules = false;
 		$this->php_data_flow_analyzer = null;
+	}
+
+	/**
+	 * Disable WordPress debug mode for the lifetime of this scan process.
+	 *
+	 * The command runs before WordPress is loaded, so defining these constants
+	 * here prevents wp-config.php debug settings from enabling display/logging
+	 * during the diagnostic run. Nothing is written back to wp-config.php.
+	 */
+	private function suppress_wordpress_debug() {
+		@ini_set( 'display_errors', '0' );
+		@ini_set( 'display_startup_errors', '0' );
+		error_reporting( 0 );
+
+		if ( ! defined( 'WP_DEBUG' ) ) {
+			define( 'WP_DEBUG', false );
+		}
+
+		if ( ! defined( 'WP_DEBUG_DISPLAY' ) ) {
+			define( 'WP_DEBUG_DISPLAY', false );
+		}
+
+		if ( ! defined( 'WP_DEBUG_LOG' ) ) {
+			define( 'WP_DEBUG_LOG', false );
+		}
 	}
 
 	/**
@@ -857,8 +887,8 @@ class Security_Scan_Command {
 		if ( $has_embedded_php && in_array( $extension, self::NON_PHP_MEDIA_EXTENSIONS, true ) ) {
 			if ( $is_uploads ) {
 				$this->add_file_finding_once( $seen, $stage, 'critical', 99, $relative, 'uploads_embedded_php', 'PHP code embedded inside a non-PHP upload', $php_buffer_start_line );
-			} else {
-				$this->add_file_finding_once( $seen, $stage, 'critical', 99, $relative, 'php_in_non_php', 'PHP code detected inside a non-PHP file', $php_buffer_start_line );
+			} elseif ( ! in_array( $extension, self::NON_EXECUTABLE_TEMPLATE_EXTENSIONS, true ) ) {
+				$this->add_file_finding_once( $seen, $stage, 'high', 90, $relative, 'php_in_non_php', 'PHP code detected inside a non-PHP file', $php_buffer_start_line );
 			}
 		}
 
@@ -1077,50 +1107,84 @@ class Security_Scan_Command {
 	 * Apply code-density/obfuscation heuristics.
 	 */
 	private function scan_php_density_heuristics( $stage, $relative, $buffer, array &$seen, $buffer_start_line ) {
-		$suspicious_tokens = [
+		$lower = strtolower( $buffer );
+
+		$execution_tokens = [
 			'eval(',
+			'assert(',
+			'shell_exec(',
+			'passthru(',
+			'proc_open(',
+			'call_user_func(',
+		];
+
+		$obfuscation_tokens = [
 			'base64_decode(',
 			'gzinflate(',
 			'gzuncompress(',
 			'str_rot13(',
 			'strrev(',
 			'str_repeat(',
-			'chr(',
 			'openssl_decrypt(',
+		];
+
+		$untrusted_tokens = [
 			'php://input',
-			'call_user_func(',
-			'shell_exec(',
-			'passthru(',
-			'proc_open(',
-			'assert(',
 			'$_request',
+			'$_post',
+			'$_get',
 			'$_cookie',
 			'$globals',
 		];
 
-		$count = 0;
-		$first_offset = null;
-		$lower = strtolower( $buffer );
-		foreach ( $suspicious_tokens as $token ) {
-			$offset = strpos( $lower, $token );
-			if ( false !== $offset ) {
-				$count++;
-				if ( null === $first_offset || $offset < $first_offset ) {
-					$first_offset = $offset;
-				}
-			}
-		}
+		$execution_count = $this->count_present_tokens( $lower, $execution_tokens );
+		$obfuscation_count = $this->count_present_tokens( $lower, $obfuscation_tokens );
+		$untrusted_count = $this->count_present_tokens( $lower, $untrusted_tokens );
 
-		if ( $count >= 5 ) {
+		// Density is only a reportable heuristic when several independent
+		// malware properties occur together. Common libraries legitimately use
+		// crypto/encoding primitives, callbacks and request data in isolation.
+		if ( $execution_count >= 1 && $obfuscation_count >= 2 && $untrusted_count >= 1 ) {
+			$first_offset = $this->first_present_token_offset(
+				$lower,
+				array_merge( $execution_tokens, $obfuscation_tokens, $untrusted_tokens )
+			);
 			$line = null === $first_offset ? null : $this->line_from_buffer_offset( $buffer, $buffer_start_line, $first_offset );
-			$this->add_file_finding_once( $seen, $stage, 'high', 82, $relative, 'dense_suspicious_php', 'Multiple obfuscation/execution primitives occur in the same code block', $line );
+			$this->add_file_finding_once( $seen, $stage, 'high', 88, $relative, 'dense_suspicious_php', 'Execution, obfuscation and untrusted-input primitives occur together', $line );
 		}
 
 		$long_line_matches = [];
-		if ( $count >= 2 && 1 === preg_match( '~[^\r\n]{20000,}~', $buffer, $long_line_matches, PREG_OFFSET_CAPTURE ) ) {
+		if ( $execution_count >= 1 && $obfuscation_count >= 1 && 1 === preg_match( '~[^\r\n]{20000,}~', $buffer, $long_line_matches, PREG_OFFSET_CAPTURE ) ) {
 			$line = $this->line_from_buffer_offset( $buffer, $buffer_start_line, $long_line_matches[0][1] );
-			$this->add_file_finding_once( $seen, $stage, 'high', 84, $relative, 'long_obfuscated_line', 'Very long PHP line combined with suspicious execution/decoder primitives', $line );
+			$this->add_file_finding_once( $seen, $stage, 'high', 86, $relative, 'long_obfuscated_line', 'Very long PHP line combines obfuscation with an execution primitive', $line );
 		}
+	}
+
+	/**
+	 * Count distinct indicators present in a lower-cased PHP buffer.
+	 */
+	private function count_present_tokens( $buffer, array $tokens ) {
+		$count = 0;
+		foreach ( $tokens as $token ) {
+			if ( false !== strpos( $buffer, $token ) ) {
+				$count++;
+			}
+		}
+		return $count;
+	}
+
+	/**
+	 * Find the earliest offset for any indicator in a lower-cased buffer.
+	 */
+	private function first_present_token_offset( $buffer, array $tokens ) {
+		$first = null;
+		foreach ( $tokens as $token ) {
+			$offset = strpos( $buffer, $token );
+			if ( false !== $offset && ( null === $first || $offset < $first ) ) {
+				$first = $offset;
+			}
+		}
+		return $first;
 	}
 
 	/**
