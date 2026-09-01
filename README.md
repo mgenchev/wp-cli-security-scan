@@ -126,8 +126,8 @@ Completed stages remain visible. Checksum stages intentionally do not display a 
 
 ```text
 ✓ Core checksums completed — no integrity issues found
-⚠ Plugin integrity completed — 2 integrity issues found
-⚠ Plugins scanned — 3,210 files, 3 threats found
+⚠ Plugin integrity completed — 18 verified, 3 unavailable, 1 modified, 2 integrity issues found
+⚠ Plugins scanned — 3,210 files, 3 reportable threats found
 ✓ Uploads scanned — 8,409 files, no threats found
 ⠋ Scanning database... 18,500 rows
 ```
@@ -147,15 +147,34 @@ wp security-scan core
 ## Example report
 
 ```text
+Plugin integrity
+------------------------------------------------------------------------
+1 integrity issue found
+
+some-plugin
+  ⚠ Strong recommendation: replace the entire plugin with a fresh trusted copy, then rescan.
+
+  HIGH · 98%      Checksum does not match
+                   includes/changed.php
+
 Plugins
 ------------------------------------------------------------------------
-3 threats found
+4 threats found across 1 plugin
 
-CRITICAL · 99%  Encoded payload executed with eval
-                plugins/example/inc/class-loader.php:184
+premium-plugin
+  4 findings · 1 critical · 1 high · 1 medium · 1 low
+  ? Checksums unavailable.
+  Risk score: 10 / 10
+  ⚠ Strong recommendation: replace the entire plugin with a fresh trusted copy, then rescan.
 
-HIGH · 92%      File doesn't verify against checksum: example/file.php
-                Plugins
+  CRITICAL · 99%  Encoded payload executed with eval
+                   inc/class-loader.php:184
+  HIGH · 91%      Request-controlled dynamic callback
+                   inc/callback.php:62
+  MEDIUM · 72%    Suspicious encoded execution context
+                   inc/helper.php:41
+  LOW · 55%       Low-confidence suspicious construct
+                   inc/legacy.php:19
 
 Uploads
 ------------------------------------------------------------------------
@@ -164,6 +183,7 @@ Uploads
 CRITICAL · 99%  PHP code embedded inside a non-PHP upload
                 uploads/2024/08/logo.jpg:1
 ```
+
 
 File-content findings include the source line when it can be determined, for example `plugins/example/file.php:184`. Filename-only, checksum, symlink, and database findings may not have a line number.
 
@@ -214,6 +234,61 @@ Patterns include PHP code, `eval()`, `base64_decode()`, gzip decoders, `phpinfo(
 ## Non-executable backup/data files
 
 Raw contents of database dumps, source maps and compressed archives are skipped by the static code scanner (`.sql`, `.dump`, `.zip`, `.gz`, `.tar`, `.7z`, `.rar`, `.map`, etc.). These files can legitimately contain historical malware strings or bundled source text but are not directly executable by WordPress/PHP. Executable files placed beside them are still scanned normally.
+
+
+## Plugin integrity, risk scoring, and remediation
+
+Plugin checksum integrity is the primary trust signal for normal WordPress.org plugins. The scanner still performs the static code scan, but the human-readable and JSON reports apply the checksum result before plugin findings are exposed:
+
+- **Verified** — `wp plugin verify-checksums --strict` matches the installed plugin version. Ordinary static heuristic findings are suppressed because they are part of the official release rather than local tampering.
+- **Modified** — one or more files fail checksum verification or a required plugin file is missing. The report strongly recommends replacing the entire plugin with a fresh trusted copy and rescanning.
+- **Unavailable / unverified** — WordPress.org checksums cannot be obtained, which is common for premium and custom plugins. Static findings remain visible and use the weighted risk score below.
+
+For plugins without trusted checksums, the score is cumulative:
+
+```text
+CRITICAL = 4
+HIGH     = 3
+MEDIUM   = 2
+LOW      = 1
+```
+
+A score from `0–9` results in manual-review guidance. A score of `10+` results in a strong fresh-copy recommendation.
+
+Human-readable reports group findings by plugin and then by issue type. **Every affected file path is printed in the terminal and Markdown report**; repeated issues are grouped only to improve navigation, not to hide locations.
+
+Example:
+
+```text
+premium-plugin
+  4 findings · 1 critical · 1 high · 1 medium · 1 low
+  ? Checksums unavailable.
+  Risk score: 10 / 10
+  ⚠ Strong recommendation: replace the entire plugin with a fresh trusted copy, then rescan.
+
+  CRITICAL · 99%  Request-controlled data reaches command execution
+                   includes/a.php:120
+  HIGH · 91%      Request-controlled dynamic callback
+                   includes/b.php:88
+  MEDIUM · 72%    Suspicious encoded execution context
+                   includes/c.php:41
+  LOW · 55%       Low-confidence suspicious construct
+                   includes/d.php:19
+```
+
+Checksum-failed plugins receive the reinstall recommendation regardless of static score because local integrity has already been disproved.
+
+### Verified but still suspicious plugins
+
+A successful checksum proves that the local files match the upstream WordPress.org release; it does **not** prove that the upstream release itself is safe. To preserve this distinction, verified plugins suppress ordinary heuristics but still allow independent plugin-risk signals:
+
+- WordPress.org reports the plugin as closed or disabled;
+- a `CRITICAL` exact known IOC with at least 97% confidence is present in executable PHP/JavaScript code.
+
+Repository closure is treated separately from malware heuristics because a plugin can be closed for reasons other than security. If the WordPress.org response explicitly indicates a security-related closure, the finding is raised accordingly.
+
+The normalized JSON report also includes a `plugin_integrity` map with each installed plugin's checksum and repository status.
+
 
 ## Severity and confidence
 
@@ -271,7 +346,7 @@ Skip WordPress.org plugin checksum verification:
 wp security-scan --skip-plugin-checksums
 ```
 
-Premium/custom plugins without WordPress.org checksums are still scanned by the static malware engine.
+Premium/custom plugins without WordPress.org checksums are still scanned by the static malware engine and use the weighted risk score. If plugin checksum verification is skipped entirely, installed plugins are treated as unverified rather than trusted.
 
 ## Extending known indicators
 

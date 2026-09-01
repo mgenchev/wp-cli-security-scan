@@ -1,5 +1,36 @@
 # Changelog
 
+## [0.3.0] - 2026-09-01
+
+### Added
+
+- Added per-plugin integrity states: `verified`, `modified`, `unavailable`, and `unverified`.
+- Added structured parsing of `wp plugin verify-checksums --all --strict --format=json` so checksum failures are associated with the exact plugin and file.
+- Added a weighted risk score for plugins without trusted checksums: `CRITICAL=4`, `HIGH=3`, `MEDIUM=2`, `LOW=1`; score `10+` triggers a strong fresh-copy recommendation.
+- Added WordPress.org repository-status checks for verified plugins so closed/disabled upstream plugins can still be surfaced independently of local checksum integrity.
+- Added plugin-integrity metadata to JSON reports.
+- Added plugin-integrity regression tests.
+
+### Changed
+
+- Ordinary static findings from checksum-verified WordPress.org plugins are suppressed from reports.
+- Checksum-failed plugins receive a direct strong recommendation to replace the complete plugin with a fresh trusted copy and rescan.
+- Unavailable/unverified plugins keep grouped static findings and use weighted scoring to choose manual review vs reinstall guidance.
+- Critical exact known IOCs in executable plugin code remain reportable even when checksums match, preserving a narrow defense against a compromised upstream release.
+- Terminal plugin reports now print every affected path; issue grouping no longer truncates locations.
+- Plugin integrity progress reports verified, unavailable, modified, and unverified plugin counts instead of only a flat issue total.
+
+## [0.2.3] - 2026-09-01
+
+### Changed
+
+- Plugin findings in terminal and Markdown reports are grouped by plugin and then by issue type.
+- Repeated instances of the same plugin rule are collapsed into one issue with occurrence counts.
+- Plugins with 3+ high/critical findings or 5+ total findings receive a fresh trusted copy recommendation.
+- Terminal plugin reports show a bounded number of example paths per issue while Markdown/JSON preserve complete details.
+- Plugins requiring the strongest remediation are shown first.
+
+
 ## [0.2.2] - 2026-09-01
 
 ### Added
