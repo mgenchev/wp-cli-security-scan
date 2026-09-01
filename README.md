@@ -428,3 +428,7 @@ No static scanner can prove that a site is clean. Malware can be novel, encrypte
 ### Variable-variable detection
 
 Legitimate variable-variable assignments such as `$$key = $value` are not reported. Findings are limited to dynamic execution patterns such as `$$func()` / `${$func}()`.
+
+### Automatic scan log
+
+Every completed scan overwrites `security-scan.log` in the WordPress root. The log is intended for manual incident review and contains the detailed findings, grouped upload issues, plugin integrity mismatch details, and recommendations.

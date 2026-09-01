@@ -10,7 +10,7 @@ if ( ! defined( 'WP_CLI' ) || ! WP_CLI ) {
 }
 
 class Security_Scan_Command {
-	private const VERSION = '0.3.4';
+	private const VERSION = '0.3.5';
 	private const DB_BATCH_SIZE = 500;
 	private const FILE_CHUNK_SIZE = 524288;
 	private const FILE_CHUNK_OVERLAP = 8192;
@@ -2898,6 +2898,7 @@ PHP;
 
 		$this->modification_clusters = $this->build_finding_mtime_clusters( $filtered );
 		$report = $this->build_report( $filtered );
+		$this->write_scan_log( $report );
 		$output_file = isset( $assoc_args['output'] ) ? (string) $assoc_args['output'] : '';
 
 		if ( 'json' === $this->format ) {
@@ -3269,6 +3270,158 @@ PHP;
 		return count( (array) $this->plugin_integrity[ $plugin ]['checksum_errors'] );
 	}
 
+
+	/**
+	 * Return plugins whose installed files differ from the official checksum manifest.
+	 */
+	private function modified_plugin_slugs() {
+		$slugs = [];
+		foreach ( $this->plugin_integrity as $slug => $data ) {
+			if ( 'modified' === ( $data['status'] ?? '' ) ) {
+				$slugs[] = (string) $slug;
+			}
+		}
+
+		sort( $slugs, SORT_STRING );
+		return $slugs;
+	}
+
+	/**
+	 * Group findings by the actual problem/rule while preserving every path.
+	 */
+	private function group_findings_by_issue( array $findings ) {
+		$groups = [];
+		foreach ( $findings as $finding ) {
+			$key = ! empty( $finding['rule'] ) ? (string) $finding['rule'] : md5( (string) $finding['description'] );
+			if ( ! isset( $groups[ $key ] ) ) {
+				$groups[ $key ] = [
+					'description' => (string) $finding['description'],
+					'severity'    => (string) $finding['severity'],
+					'confidence'  => (int) $finding['confidence'],
+					'findings'    => [],
+				];
+			}
+
+			$groups[ $key ]['findings'][] = $finding;
+			if (
+				self::SEVERITY_WEIGHT[ $finding['severity'] ] > self::SEVERITY_WEIGHT[ $groups[ $key ]['severity'] ]
+				|| (
+					$finding['severity'] === $groups[ $key ]['severity']
+					&& (int) $finding['confidence'] > (int) $groups[ $key ]['confidence']
+				)
+			) {
+				$groups[ $key ]['severity'] = (string) $finding['severity'];
+				$groups[ $key ]['confidence'] = (int) $finding['confidence'];
+				$groups[ $key ]['description'] = (string) $finding['description'];
+			}
+		}
+
+		$groups = array_values( $groups );
+		usort(
+			$groups,
+			static function ( $a, $b ) {
+				$severity_compare = self::SEVERITY_WEIGHT[ $b['severity'] ] <=> self::SEVERITY_WEIGHT[ $a['severity'] ];
+				if ( 0 !== $severity_compare ) {
+					return $severity_compare;
+				}
+				$confidence_compare = $b['confidence'] <=> $a['confidence'];
+				if ( 0 !== $confidence_compare ) {
+					return $confidence_compare;
+				}
+				$count_compare = count( $b['findings'] ) <=> count( $a['findings'] );
+				if ( 0 !== $count_compare ) {
+					return $count_compare;
+				}
+				return strcmp( $a['description'], $b['description'] );
+			}
+		);
+
+		return $groups;
+	}
+
+	/**
+	 * Build a complete finding location with source line when available.
+	 */
+	private function finding_location( array $finding ) {
+		$location = (string) $finding['location'];
+		if ( ! empty( $finding['line'] ) ) {
+			$location .= ':' . $finding['line'];
+		}
+		return $location;
+	}
+
+	/**
+	 * Render a normal section grouped by problem and preserving all locations.
+	 */
+	private function render_terminal_grouped_findings( array $findings ) {
+		foreach ( $this->group_findings_by_issue( $findings ) as $issue ) {
+			$count = count( $issue['findings'] );
+			$label = strtoupper( $issue['severity'] ) . ' · ' . $issue['confidence'] . '%';
+			$suffix = $count > 1 ? sprintf( ' (%d occurrences)', $count ) : '';
+			\WP_CLI::log( sprintf( '%-16s %s%s', $label, $issue['description'], $suffix ) );
+			foreach ( $issue['findings'] as $finding ) {
+				\WP_CLI::log( str_repeat( ' ', 17 ) . $this->finding_location( $finding ) );
+			}
+			\WP_CLI::log( '' );
+		}
+	}
+
+	/**
+	 * Render grouped findings as Markdown while preserving all locations.
+	 */
+	private function render_markdown_grouped_findings( array $findings ) {
+		$lines = [];
+		foreach ( $this->group_findings_by_issue( $findings ) as $issue ) {
+			$count = count( $issue['findings'] );
+			$lines[] = sprintf(
+				'**%s · %d%% — %s%s**',
+				strtoupper( $issue['severity'] ),
+				$issue['confidence'],
+				$this->markdown_escape( $issue['description'] ),
+				$count > 1 ? ' (' . $count . ' occurrences)' : ''
+			);
+			$lines[] = '';
+			foreach ( $issue['findings'] as $finding ) {
+				$lines[] = '- `' . $this->markdown_escape( $this->finding_location( $finding ) ) . '`';
+			}
+			$lines[] = '';
+		}
+		return $lines;
+	}
+
+	/**
+	 * Show only the names of plugins with checksum integrity problems.
+	 */
+	private function render_terminal_plugin_integrity_list() {
+		$slugs = $this->modified_plugin_slugs();
+		if ( empty( $slugs ) ) {
+			return;
+		}
+
+		\WP_CLI::log( 'Integrity issues' );
+		foreach ( $slugs as $slug ) {
+			\WP_CLI::log( '  ⚠ ' . $slug );
+		}
+		\WP_CLI::log( '' );
+	}
+
+	/**
+	 * Markdown list of plugins with checksum integrity problems.
+	 */
+	private function render_markdown_plugin_integrity_list() {
+		$slugs = $this->modified_plugin_slugs();
+		if ( empty( $slugs ) ) {
+			return [];
+		}
+
+		$lines = [ '### Integrity issues', '' ];
+		foreach ( $slugs as $slug ) {
+			$lines[] = '- ⚠ `' . $this->markdown_escape( $slug ) . '`';
+		}
+		$lines[] = '';
+		return $lines;
+	}
+
 	/**
 	 * Build remediation recommendations after plugin findings have been analyzed.
 	 *
@@ -3337,7 +3490,7 @@ PHP;
 	}
 
 	/**
-	 * Render all plugin remediation recommendations at the end of the section.
+	 * Render remediation recommendations grouped by reason and priority.
 	 */
 	private function render_terminal_plugin_recommendations( array $groups ) {
 		$recommendations = $this->plugin_recommendations( $groups );
@@ -3348,78 +3501,128 @@ PHP;
 			return;
 		}
 
+		$buckets = [
+			'integrity' => [],
+			'threshold' => [],
+			'review'    => [],
+		];
+		foreach ( $recommendations as $recommendation ) {
+			if ( 'Plugin integrity verification failed.' === $recommendation['reason'] ) {
+				$buckets['integrity'][] = $recommendation['slug'];
+			} elseif ( 'reinstall' === $recommendation['action'] ) {
+				$buckets['threshold'][] = $recommendation['slug'];
+			} else {
+				$buckets['review'][] = $recommendation['slug'];
+			}
+		}
+
 		\WP_CLI::log( '' );
 		\WP_CLI::log( 'Recommendations' );
 		\WP_CLI::log( str_repeat( '─', 40 ) );
 
-		foreach ( $recommendations as $recommendation ) {
-			\WP_CLI::log( '⚠ ' . $recommendation['slug'] );
-			if ( 'reinstall' === $recommendation['action'] ) {
-				\WP_CLI::log( '  Replace the entire plugin with a fresh trusted copy, then rescan.' );
-			} else {
-				\WP_CLI::log( '  Manually review the grouped findings.' );
+		if ( ! empty( $buckets['integrity'] ) ) {
+			\WP_CLI::log( 'HIGH PRIORITY — Plugin integrity verification failed' );
+			foreach ( $buckets['integrity'] as $slug ) {
+				\WP_CLI::log( '  ⚠ ' . $slug );
+			}
+			\WP_CLI::log( '  Replace these plugins with fresh trusted copies, then rescan.' );
+			\WP_CLI::log( '' );
+		}
+
+		if ( ! empty( $buckets['threshold'] ) ) {
+			\WP_CLI::log( 'HIGH PRIORITY — Suspicious findings exceeded the replacement threshold' );
+			foreach ( $buckets['threshold'] as $slug ) {
+				\WP_CLI::log( '  ⚠ ' . $slug );
+			}
+			\WP_CLI::log( '  Replace these plugins with fresh trusted copies, then rescan.' );
+			\WP_CLI::log( '' );
+		}
+
+		if ( ! empty( $buckets['review'] ) ) {
+			\WP_CLI::log( 'REVIEW — Suspicious plugin findings require manual review' );
+			foreach ( $buckets['review'] as $slug ) {
+				\WP_CLI::log( '  ⚠ ' . $slug );
 			}
 			\WP_CLI::log( '' );
 		}
 
-		if ( $has_inactive_plugins ) {
-			$count = count( $this->inactive_plugins );
-			\WP_CLI::log(
-				sprintf(
-					'⚠ %d inactive plugin%s detected — not scanned; remove %s if not needed.',
-					$count,
-					1 === $count ? '' : 's',
-					1 === $count ? 'it' : 'them'
-				)
-			);
-			\WP_CLI::log( '' );
-		}
-
-		if ( $has_inactive_themes ) {
-			$count = count( $this->inactive_themes );
-			\WP_CLI::log(
-				sprintf(
-					'⚠ %d inactive theme%s detected — not scanned; remove %s if not needed.',
-					$count,
-					1 === $count ? '' : 's',
-					1 === $count ? 'it' : 'them'
-				)
-			);
+		if ( $has_inactive_plugins || $has_inactive_themes ) {
+			\WP_CLI::log( 'CLEANUP — Inactive code is not scanned' );
+			if ( $has_inactive_plugins ) {
+				$count = count( $this->inactive_plugins );
+				\WP_CLI::log( sprintf( '  ⚠ %d inactive plugin%s detected — not scanned; remove %s if not needed.', $count, 1 === $count ? '' : 's', 1 === $count ? 'it' : 'them' ) );
+			}
+			if ( $has_inactive_themes ) {
+				$count = count( $this->inactive_themes );
+				\WP_CLI::log( sprintf( '  ⚠ %d inactive theme%s detected — not scanned; remove %s if not needed.', $count, 1 === $count ? '' : 's', 1 === $count ? 'it' : 'them' ) );
+			}
 		}
 	}
 
 	/**
-	 * Build Markdown remediation recommendations.
+	 * Build Markdown remediation recommendations grouped by reason and priority.
 	 */
 	private function render_markdown_plugin_recommendations( array $groups ) {
 		$recommendations = $this->plugin_recommendations( $groups );
 		$has_inactive_plugins = ! empty( $this->inactive_plugins );
 		$has_inactive_themes = ! empty( $this->inactive_themes );
-
 		if ( empty( $recommendations ) && ! $has_inactive_plugins && ! $has_inactive_themes ) {
 			return [];
 		}
 
-		$lines = [ '## Recommendations', '' ];
+		$buckets = [ 'integrity' => [], 'threshold' => [], 'review' => [] ];
 		foreach ( $recommendations as $recommendation ) {
-			if ( 'reinstall' === $recommendation['action'] ) {
-				$lines[] = '- ⚠ **`' . $this->markdown_escape( $recommendation['slug'] ) . '`** — Replace the entire plugin with a fresh trusted copy, then rescan.';
+			if ( 'Plugin integrity verification failed.' === $recommendation['reason'] ) {
+				$buckets['integrity'][] = $recommendation['slug'];
+			} elseif ( 'reinstall' === $recommendation['action'] ) {
+				$buckets['threshold'][] = $recommendation['slug'];
 			} else {
-				$lines[] = '- ⚠ **`' . $this->markdown_escape( $recommendation['slug'] ) . '`** — Manually review the grouped findings.';
+				$buckets['review'][] = $recommendation['slug'];
 			}
 		}
 
-		if ( $has_inactive_plugins ) {
-			$count = count( $this->inactive_plugins );
-			$lines[] = '- ⚠ ' . $count . ' inactive plugin' . ( 1 === $count ? '' : 's' ) . ' detected — not scanned; remove ' . ( 1 === $count ? 'it' : 'them' ) . ' if not needed.';
+		$lines = [ '## Recommendations', '' ];
+		if ( ! empty( $buckets['integrity'] ) ) {
+			$lines[] = '### High priority — Plugin integrity verification failed';
+			$lines[] = '';
+			foreach ( $buckets['integrity'] as $slug ) {
+				$lines[] = '- ⚠ `' . $this->markdown_escape( $slug ) . '`';
+			}
+			$lines[] = '';
+			$lines[] = 'Replace these plugins with fresh trusted copies, then rescan.';
+			$lines[] = '';
 		}
-
-		if ( $has_inactive_themes ) {
-			$count = count( $this->inactive_themes );
-			$lines[] = '- ⚠ ' . $count . ' inactive theme' . ( 1 === $count ? '' : 's' ) . ' detected — not scanned; remove ' . ( 1 === $count ? 'it' : 'them' ) . ' if not needed.';
+		if ( ! empty( $buckets['threshold'] ) ) {
+			$lines[] = '### High priority — Suspicious findings exceeded the replacement threshold';
+			$lines[] = '';
+			foreach ( $buckets['threshold'] as $slug ) {
+				$lines[] = '- ⚠ `' . $this->markdown_escape( $slug ) . '`';
+			}
+			$lines[] = '';
+			$lines[] = 'Replace these plugins with fresh trusted copies, then rescan.';
+			$lines[] = '';
 		}
-
-		$lines[] = '';
+		if ( ! empty( $buckets['review'] ) ) {
+			$lines[] = '### Review — Suspicious plugin findings require manual review';
+			$lines[] = '';
+			foreach ( $buckets['review'] as $slug ) {
+				$lines[] = '- ⚠ `' . $this->markdown_escape( $slug ) . '`';
+			}
+			$lines[] = '';
+		}
+		if ( $has_inactive_plugins || $has_inactive_themes ) {
+			$lines[] = '### Cleanup — Inactive code is not scanned';
+			$lines[] = '';
+			if ( $has_inactive_plugins ) {
+				$count = count( $this->inactive_plugins );
+				$lines[] = '- ⚠ ' . $count . ' inactive plugin' . ( 1 === $count ? '' : 's' ) . ' detected — not scanned; remove ' . ( 1 === $count ? 'it' : 'them' ) . ' if not needed.';
+			}
+			if ( $has_inactive_themes ) {
+				$count = count( $this->inactive_themes );
+				$lines[] = '- ⚠ ' . $count . ' inactive theme' . ( 1 === $count ? '' : 's' ) . ' detected — not scanned; remove ' . ( 1 === $count ? 'it' : 'them' ) . ' if not needed.';
+			}
+			$lines[] = '';
+		}
 		return $lines;
 	}
 
@@ -3495,10 +3698,6 @@ PHP;
 		$lines[] = '';
 
 		foreach ( $groups as $group ) {
-			if ( 'reinstall' === $group['action'] ) {
-				continue;
-			}
-
 			$lines[] = '### `' . $this->markdown_escape( $group['slug'] ) . '`';
 			$lines[] = '';
 			$lines[] = $group['total'] . ' finding' . ( 1 === $group['total'] ? '' : 's' ) . '.';
@@ -3633,6 +3832,7 @@ PHP;
 
 				if ( 'Plugins' === $section ) {
 					$this->render_terminal_plugin_findings( $findings );
+					$this->render_terminal_plugin_integrity_list();
 					continue;
 				}
 
@@ -3643,14 +3843,15 @@ PHP;
 				}
 				\WP_CLI::log( '' );
 
+				if ( 'Uploads' === $section ) {
+					$this->render_terminal_grouped_findings( $findings );
+					continue;
+				}
+
 				foreach ( $findings as $finding ) {
 					$label = strtoupper( $finding['severity'] ) . ' · ' . $finding['confidence'] . '%';
-					$location = $finding['location'];
-					if ( ! empty( $finding['line'] ) ) {
-						$location .= ':' . $finding['line'];
-					}
 					\WP_CLI::log( sprintf( '%-16s %s', $label, $finding['description'] ) );
-					\WP_CLI::log( str_repeat( ' ', 17 ) . $location );
+					\WP_CLI::log( str_repeat( ' ', 17 ) . $this->finding_location( $finding ) );
 				}
 			}
 		}
@@ -3813,6 +4014,14 @@ PHP;
 
 			if ( 'Plugins' === $section ) {
 				$lines = array_merge( $lines, $this->render_markdown_plugin_findings( $findings ) );
+				$lines = array_merge( $lines, $this->render_markdown_plugin_integrity_list() );
+				continue;
+			}
+
+			if ( 'Uploads' === $section ) {
+				$lines[] = count( $findings ) . ' threat' . ( 1 === count( $findings ) ? '' : 's' ) . ' found.';
+				$lines[] = '';
+				$lines = array_merge( $lines, $this->render_markdown_grouped_findings( $findings ) );
 				continue;
 			}
 
@@ -3854,6 +4063,122 @@ PHP;
 			)
 		);
 		$lines = array_merge( $lines, $this->render_markdown_plugin_recommendations( $this->group_plugin_findings( $plugin_findings ) ) );
+
+		return implode( PHP_EOL, $lines ) . PHP_EOL;
+	}
+
+
+	/**
+	 * Write a complete human-readable scan log, replacing the previous scan log.
+	 */
+	private function write_scan_log( array $report ) {
+		$root = defined( 'ABSPATH' ) ? rtrim( ABSPATH, '/\\' ) : getcwd();
+		$path = $root . DIRECTORY_SEPARATOR . 'security-scan.log';
+		$content = $this->render_scan_log( $report );
+		if ( false === @file_put_contents( $path, $content, LOCK_EX ) ) {
+			return null;
+		}
+		return $path;
+	}
+
+	/**
+	 * Build a detailed plain-text report intended for manual incident review.
+	 */
+	private function render_scan_log( array $report ) {
+		$lines = [];
+		$lines[] = 'WordPress Security Scan';
+		$lines[] = str_repeat( '=', 72 );
+		$lines[] = 'Version: ' . self::VERSION;
+		$lines[] = 'Scanned at: ' . ( $report['scanned_at'] ?? gmdate( 'c' ) );
+		$lines[] = 'Duration: ' . ( $report['duration_seconds'] ?? 0 ) . 's';
+		$lines[] = '';
+		$lines[] = 'Summary';
+		$lines[] = str_repeat( '-', 72 );
+		$lines[] = 'Critical: ' . (int) $report['severity']['critical'];
+		$lines[] = 'High: ' . (int) $report['severity']['high'];
+		$lines[] = 'Medium: ' . (int) $report['severity']['medium'];
+		$lines[] = 'Low: ' . (int) $report['severity']['low'];
+		$lines[] = 'Files scanned: ' . number_format( (int) $report['files_scanned'] );
+		$lines[] = 'Database rows scanned: ' . number_format( (int) $report['database_rows'] );
+		$lines[] = 'Administrator users: ' . number_format( (int) $report['administrator_users'] );
+		$lines[] = 'Threats found: ' . number_format( (int) $report['total_findings'] );
+		$lines[] = '';
+
+		$sections = [];
+		foreach ( $report['findings'] as $finding ) {
+			$sections[ $finding['section'] ][] = $finding;
+		}
+		if ( ! isset( $sections['Plugins'] ) && ! empty( $this->modified_plugin_slugs() ) ) {
+			$sections['Plugins'] = [];
+		}
+		$sections = $this->order_report_sections( $sections );
+
+		foreach ( $sections as $section => $findings ) {
+			$lines[] = $section;
+			$lines[] = str_repeat( '-', 72 );
+			if ( 'Plugins' === $section ) {
+				$groups = $this->group_plugin_findings( $findings );
+				foreach ( $groups as $group ) {
+					$lines[] = $group['slug'] . ' — ' . $group['total'] . ' finding' . ( 1 === $group['total'] ? '' : 's' );
+					foreach ( $group['issues'] as $issue ) {
+						$count = count( $issue['findings'] );
+						$lines[] = '  ' . strtoupper( $issue['severity'] ) . ' · ' . $issue['confidence'] . '%  ' . $issue['description'] . ( $count > 1 ? ' (' . $count . ' occurrences)' : '' );
+						foreach ( $issue['findings'] as $finding ) {
+							$lines[] = '    ' . $this->plugin_relative_finding_location( $finding, $group['slug'] );
+						}
+					}
+					$lines[] = '';
+				}
+
+				$modified = $this->modified_plugin_slugs();
+				if ( ! empty( $modified ) ) {
+					$lines[] = 'Plugin integrity details';
+					foreach ( $modified as $slug ) {
+						$lines[] = '  ' . $slug;
+						foreach ( (array) ( $this->plugin_integrity[ $slug ]['checksum_errors'] ?? [] ) as $error ) {
+							$file = 'plugins/' . $slug . '/' . ltrim( str_replace( '\\', '/', (string) ( $error['file'] ?? '' ) ), '/' );
+							$lines[] = '    ' . $file . ' — ' . (string) ( $error['message'] ?? 'Integrity mismatch' );
+						}
+					}
+					$lines[] = '';
+				}
+				continue;
+			}
+
+			if ( 'Uploads' === $section ) {
+				foreach ( $this->group_findings_by_issue( $findings ) as $issue ) {
+					$count = count( $issue['findings'] );
+					$lines[] = strtoupper( $issue['severity'] ) . ' · ' . $issue['confidence'] . '%  ' . $issue['description'] . ( $count > 1 ? ' (' . $count . ' occurrences)' : '' );
+					foreach ( $issue['findings'] as $finding ) {
+						$lines[] = '  ' . $this->finding_location( $finding );
+					}
+					$lines[] = '';
+				}
+				continue;
+			}
+
+			foreach ( $findings as $finding ) {
+				$lines[] = strtoupper( $finding['severity'] ) . ' · ' . $finding['confidence'] . '%  ' . $finding['description'];
+				$lines[] = '  ' . $this->finding_location( $finding );
+			}
+			$lines[] = '';
+		}
+
+		$plugin_findings = array_values( array_filter( $report['findings'], static function ( $finding ) { return 'Plugins' === ( $finding['section'] ?? '' ); } ) );
+		$recommendations = $this->plugin_recommendations( $this->group_plugin_findings( $plugin_findings ) );
+		if ( ! empty( $recommendations ) || ! empty( $this->inactive_plugins ) || ! empty( $this->inactive_themes ) ) {
+			$lines[] = 'Recommendations';
+			$lines[] = str_repeat( '-', 72 );
+			foreach ( $recommendations as $recommendation ) {
+				$lines[] = strtoupper( $recommendation['action'] ) . '  ' . $recommendation['slug'] . ' — ' . $recommendation['reason'];
+			}
+			if ( ! empty( $this->inactive_plugins ) ) {
+				$lines[] = 'CLEANUP  ' . count( $this->inactive_plugins ) . ' inactive plugins detected — not scanned; remove them if not needed.';
+			}
+			if ( ! empty( $this->inactive_themes ) ) {
+				$lines[] = 'CLEANUP  ' . count( $this->inactive_themes ) . ' inactive themes detected — not scanned; remove them if not needed.';
+			}
+		}
 
 		return implode( PHP_EOL, $lines ) . PHP_EOL;
 	}

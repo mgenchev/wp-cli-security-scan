@@ -126,18 +126,13 @@ WP_CLI::$logs = [];
 $recommendations->invoke( $command, $groups );
 $recommendation_output = implode( "\n", WP_CLI::$logs );
 
-if ( false === strpos( $recommendation_output, "⚠ reinstall-plugin\n  Replace the entire plugin with a fresh trusted copy, then rescan." ) ) {
-	fwrite( STDERR, "Threshold replacement recommendation is missing.\n" );
+if ( false === strpos( $recommendation_output, 'HIGH PRIORITY — Suspicious findings exceeded the replacement threshold' ) || false === strpos( $recommendation_output, '  ⚠ reinstall-plugin' ) ) {
+	fwrite( STDERR, "Threshold replacement recommendation is missing or not grouped.\n" );
 	exit( 1 );
 }
 
-if ( false === strpos( $recommendation_output, "⚠ modified-plugin\n  Replace the entire plugin with a fresh trusted copy, then rescan." ) ) {
-	fwrite( STDERR, "Checksum-modified plugin recommendation is missing.\n" );
-	exit( 1 );
-}
-
-if ( false !== strpos( $recommendation_output, 'Plugin integrity verification failed' ) ) {
-	fwrite( STDERR, "Plugin integrity must remain an internal recommendation signal.\n" );
+if ( false === strpos( $recommendation_output, 'HIGH PRIORITY — Plugin integrity verification failed' ) || false === strpos( $recommendation_output, '  ⚠ modified-plugin' ) ) {
+	fwrite( STDERR, "Checksum-modified plugin recommendation is missing or not grouped.\n" );
 	exit( 1 );
 }
 

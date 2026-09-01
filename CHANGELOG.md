@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.3.5] - 2026-09-01
+
+### Changed
+
+- Plugin checksum integrity problems are summarized as a concise plugin list at the end of the Plugins findings section.
+- Upload findings are grouped by problem type while preserving every affected path.
+- Recommendations are grouped by remediation reason and priority instead of repeating the same instruction for each plugin.
+- Inactive plugin/theme cleanup guidance remains in the final grouped Recommendations block.
+- Markdown plugin details preserve all affected paths, including replacement candidates.
+
+### Added
+
+- Every completed scan overwrites a human-readable `security-scan.log` in the WordPress root.
+- The scan log includes detailed reportable findings, plugin checksum mismatch paths, grouped upload findings, summary metrics, and remediation guidance.
+
 ## [0.3.4] - 2026-09-01
 
 ### Changed
