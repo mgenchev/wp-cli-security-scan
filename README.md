@@ -11,9 +11,9 @@ A full scan runs in separate stages:
 1. WordPress core checksum verification (`wp core verify-checksums`)
 2. Plugin source/repository reputation
 3. WordPress.org plugin checksum verification
-4. Plugins
+4. Active plugins only
 5. MU plugins and WordPress drop-ins
-6. Themes
+6. Active theme and its parent theme only
 7. Uploads
 8. Other directories/files inside `wp-content`
 9. Database content
@@ -117,22 +117,23 @@ The command starts before WordPress is bootstrapped. The startup indicator runs 
 ⠋ Security Scan — loading WordPress...
 ```
 
-After WordPress loads, the existing staged flow continues with a single updating status line. Checksum subprocesses write their output to temporary files while the parent process keeps the spinner alive, which also avoids blocking-pipe issues on Windows:
+After WordPress loads, the staged flow continues with a single updating status line. Plugin reputation lookups and WordPress.org checksum-manifest downloads are performed in parallel when cURL multi is available, with a secure sequential fallback:
 
 ```text
 ⠸ Scanning plugins... 1,842 files
 ```
 
-Completed stages remain visible. Checksum stages intentionally do not display a fake file count because WP-CLI does not expose the number of files it verified:
+Completed stages remain visible, but completion lines intentionally show only findings rather than repeating how many files/rows were processed. Plugin integrity remains an internal remediation signal and does not get its own completed-status line:
 
 ```text
 ✓ Core checksums completed — no integrity issues found
-✓ Plugin reputation checked — 18 WordPress.org, 3 external, 1 unknown, no reputation warnings found
-⚠ Plugin integrity completed — 18 verified, 3 unavailable, 1 modified, 2 integrity issues found
-⚠ Plugins scanned — 3,210 files, 3 reportable threats found
-✓ Uploads scanned — 8,409 files, no threats found
+✓ Plugin reputation checked — no threats found
+⚠ Plugins scanned — 3 threats found
+✓ Uploads scanned — no threats found
 ⠋ Scanning database... 18,500 rows
 ```
+
+The live spinner may show progress counts while a stage is running; scan-volume totals are kept for the final Summary only.
 
 ## Scan individual areas
 
@@ -149,34 +150,16 @@ wp security-scan core
 ## Example report
 
 ```text
-Plugin integrity
-------------------------------------------------------------------------
-1 integrity issue found
-
-some-plugin
-  ⚠ Strong recommendation: replace the entire plugin with a fresh trusted copy, then rescan.
-
-  HIGH · 98%      Checksum does not match
-                   includes/changed.php
-
 Plugins
 ------------------------------------------------------------------------
 4 threats found across 1 plugin
 
 premium-plugin
-  4 findings · 1 critical · 1 high · 1 medium · 1 low
-  ? Checksums unavailable.
-  Risk score: 10 / 10
-  ⚠ Strong recommendation: replace the entire plugin with a fresh trusted copy, then rescan.
+  2 findings
 
-  CRITICAL · 99%  Encoded payload executed with eval
-                   inc/class-loader.php:184
   HIGH · 91%      Request-controlled dynamic callback
-                   inc/callback.php:62
-  MEDIUM · 72%    Suspicious encoded execution context
-                   inc/helper.php:41
-  LOW · 55%       Low-confidence suspicious construct
-                   inc/legacy.php:19
+                   plugins/premium-plugin/includes/a.php:88
+                   plugins/premium-plugin/includes/b.php:102
 
 Uploads
 ------------------------------------------------------------------------
@@ -184,12 +167,51 @@ Uploads
 
 CRITICAL · 99%  PHP code embedded inside a non-PHP upload
                 uploads/2024/08/logo.jpg:1
+
+Summary
+----------------------------------------
+✓ Checksums   no integrity issues
+✓ Themes      no threats
+⚠ Plugins     4 threats
+⚠ Uploads     1 threat
+✓ Database    no threats
+
+Recommendations
+----------------------------------------
+⚠ some-plugin
+  Replace the entire plugin with a fresh trusted copy, then rescan.
+
+⚠ premium-plugin
+  Manually review the grouped findings.
+
+⚠ 5 inactive plugins detected — not scanned; remove them if not needed.
 ```
 
 
 File-content findings include the source line when it can be determined, for example `plugins/example/file.php:184`. Filename-only, checksum, symlink, and database findings may not have a line number.
 
-The final summary includes severity counts, files scanned, database rows scanned, administrator count, total findings, and scan duration. The Findings report always includes a Database section when the database stage runs, including the number of rows scanned even when no database threats are found. Findings are displayed in a fixed order beginning with checksum integrity, followed by themes, plugins, uploads, other wp-content checks, database findings, and persistence checks. Each terminal finding prints the problem first and the affected path/line underneath it for faster review.
+The final summary includes severity counts, files scanned, database rows scanned, administrator count, total findings, and scan duration. The Findings report always includes a Database section when the database stage runs, but the row count is shown only once in the final Summary. Findings are displayed in a fixed order beginning with checksum integrity, followed by themes, plugins, uploads, other wp-content checks, database findings, and persistence checks. Each terminal finding prints the problem first and the affected path/line underneath it for faster review.
+
+
+## Active-only plugin and theme scope
+
+Regular plugin and theme malware scanning is intentionally limited to code that can currently execute:
+
+- only **active regular plugins** are reputation-checked, checksum-verified, and statically scanned;
+- inactive plugins are not scanned; their removal guidance is collected in the final Recommendations block;
+- only the **active theme** is scanned; when a child theme is active, its parent theme is scanned as well;
+- inactive themes are not scanned; their removal guidance is collected in the final Recommendations block.
+
+MU plugins and WordPress drop-ins remain in scope because they are loaded independently of the normal active-plugin list.
+
+Example startup scope feedback:
+
+```text
+Plugin scope: active plugins only.
+Theme scope: active theme and parent theme only, when applicable.
+```
+
+Inactive plugin/theme cleanup guidance is intentionally shown only once in the final Recommendations block.
 
 
 ## `node_modules`
@@ -240,7 +262,7 @@ Raw contents of database dumps, source maps and compressed archives are skipped 
 
 ## Plugin reputation
 
-Before checksum verification, the scanner classifies the installed plugin source. It sends one read-only bulk update-check request to WordPress.org for the complete installed-plugin inventory, then performs individual repository lookups only for unresolved slugs. This avoids making one repository request for every verified plugin.
+Before checksum verification, the scanner classifies active plugin sources only. It sends one read-only bulk update-check request to WordPress.org for the active-plugin inventory, then resolves remaining repository lookups concurrently when cURL multi is available. A secure sequential WordPress HTTP fallback is used when parallel cURL is unavailable.
 
 Reputation currently distinguishes:
 
@@ -256,11 +278,13 @@ The reputation stage is read-only and does not call `wp_update_plugins()`, so it
 
 ## Plugin integrity, risk scoring, and remediation
 
-Plugin reputation is evaluated first, then checksum integrity becomes the primary local-tampering signal for normal WordPress.org plugins. The scanner still performs the static code scan, but the human-readable and JSON reports apply the checksum result before plugin findings are exposed:
+Plugin reputation is evaluated first, then local plugin integrity is checked directly against the official WordPress.org checksum manifest for the exact plugin slug/version. The scanner no longer starts a second WP-CLI/WordPress subprocess for this stage. Checksum manifests are downloaded concurrently when possible, then local files are hashed with SHA-256 (falling back to MD5 only when required by the official manifest).
 
-- **Verified** — `wp plugin verify-checksums --strict` matches the installed plugin version. Ordinary static heuristic findings are suppressed because they are part of the official release rather than local tampering.
-- **Modified** — one or more files fail checksum verification or a required plugin file is missing. The report strongly recommends replacing the entire plugin with a fresh trusted copy and rescanning.
-- **Unavailable / unverified** — WordPress.org checksums cannot be obtained, which is common for premium and custom plugins. Static findings remain visible and use the weighted risk score below.
+Integrity is an **internal remediation signal** and is intentionally not printed as its own completed stage, Findings section, risk score, checksum-status label, or JSON report section:
+
+- matching official checksums suppress ordinary static heuristics from that WordPress.org plugin;
+- a local mismatch causes a strong fresh-copy recommendation;
+- unavailable checksums, common for premium/custom plugins, leave static findings visible and use the weighted risk score below.
 
 For plugins without trusted checksums, the score is cumulative:
 
@@ -271,30 +295,37 @@ MEDIUM   = 2
 LOW      = 1
 ```
 
-A score from `0–9` results in manual-review guidance. A score of `10+` results in a strong fresh-copy recommendation.
+A score from `0–9` results in manual-review guidance. A score of `10+` results in a strong fresh-copy recommendation. The numeric score remains internal-only.
 
-Human-readable reports group findings by plugin and then by issue type. **Every affected file path is printed in the terminal and Markdown report**; repeated issues are grouped only to improve navigation, not to hide locations.
+Human-readable reports group findings by plugin and then by issue type. Paths always keep the full `plugins/<slug>/...` prefix. Plugins below the replacement threshold show every grouped affected path. Plugins that already require replacement are collapsed so a long list of findings does not hide the remediation action.
 
-Example:
+All remediation guidance is collected once in the **final Recommendations block at the end of the complete report**, including fresh-copy actions, manual-review actions, and inactive plugin/theme cleanup notices.
+
+Example for a plugin that remains below the replacement threshold:
 
 ```text
 premium-plugin
-  4 findings · 1 critical · 1 high · 1 medium · 1 low
-  ? Checksums unavailable.
-  Risk score: 10 / 10
-  ⚠ Strong recommendation: replace the entire plugin with a fresh trusted copy, then rescan.
+  3 findings
 
-  CRITICAL · 99%  Request-controlled data reaches command execution
-                   includes/a.php:120
   HIGH · 91%      Request-controlled dynamic callback
-                   includes/b.php:88
+                   plugins/premium-plugin/includes/b.php:88
   MEDIUM · 72%    Suspicious encoded execution context
-                   includes/c.php:41
+                   plugins/premium-plugin/includes/c.php:41
   LOW · 55%       Low-confidence suspicious construct
-                   includes/d.php:19
+                   plugins/premium-plugin/includes/d.php:19
 ```
 
-Checksum-failed plugins receive the reinstall recommendation regardless of static score because local integrity has already been disproved.
+When a plugin reaches the replacement threshold, its long per-file list is omitted from the terminal and the final report ends with:
+
+```text
+Recommendations
+────────────────────────────────────────
+⚠ suspicious-premium-plugin
+  Replace the entire plugin with a fresh trusted copy, then rescan.
+
+⚠ 6 inactive plugins detected — not scanned; remove them if not needed.
+```
+
 
 ### Verified but still suspicious plugins
 
@@ -306,7 +337,6 @@ A successful checksum proves that the local files match the upstream WordPress.o
 
 Repository closure is treated separately from malware heuristics because a plugin can be closed for reasons other than security. If the WordPress.org response explicitly indicates a security-related closure, the finding is raised accordingly.
 
-The normalized JSON report also includes a `plugin_integrity` map with each installed plugin's checksum status, detected source, reputation state, and repository status.
 
 
 ## Severity and confidence

@@ -1,5 +1,47 @@
 # Changelog
 
+## [0.3.4] - 2026-09-01
+
+### Changed
+
+- Plugin integrity verification is now an internal remediation signal and is no longer printed as a stage, Findings section, checksum-status label, risk score, or report section.
+- Plugin reputation and checksum HTTP lookups now use bounded parallel requests when cURL multi is available, with secure sequential fallback.
+- Plugin checksums are verified directly against official WordPress.org checksum manifests for the exact slug/version, removing the second WP-CLI/WordPress subprocess.
+- WordPress.org checksum manifests prefer SHA-256 and fall back to MD5 only when necessary.
+- Stage completion lines now show only threat/integrity results instead of repeating scanned file/row/item counts.
+- Database row counts are shown only once in the final Summary, not again in the Database Findings section.
+- Plugin group headers now show only the number of findings; source/checksum/risk metadata remains internal.
+- All remediation guidance is collected in one final Recommendations block at the end of the report.
+- Inactive plugin/theme cleanup notices moved to the final Recommendations block while startup scope output now states only that active code is scanned.
+- The Summary checksum row now represents core checksum integrity only; plugin-integrity state influences recommendations without being exposed separately.
+
+### Performance
+
+- Unresolved WordPress.org reputation lookups are performed concurrently instead of one network wait per plugin where supported.
+- Plugin checksum manifests are downloaded concurrently and verified in-process, eliminating subprocess bootstrap overhead.
+
+## [0.3.3] - 2026-09-01
+
+### Changed
+
+- Plugin recommendations are now collected once at the end of the Plugins section.
+- Plugins that cross the replacement threshold no longer flood terminal output with individual findings; the terminal goes directly to the replacement recommendation.
+- Checksum-modified plugins now show a concise integrity-change count in the terminal instead of every checksum row before the replacement recommendation.
+- Plugins below the replacement threshold continue to show grouped findings with every affected path.
+- Plugin finding paths now keep the full `plugins/<slug>/...` prefix for clearer copy/paste and triage.
+- Markdown and JSON reports retain detailed affected paths, including plugins that the terminal collapses to a replacement recommendation.
+
+## [0.3.2] - 2026-09-01
+
+### Changed
+
+- Regular plugin reputation, checksum verification, and static file scanning now cover active plugins only.
+- Inactive plugins are explicitly reported as not scanned with a recommendation to remove them when they are no longer needed.
+- Theme scanning now covers only the active theme and its parent theme when a child theme is active.
+- Inactive themes are explicitly reported as not scanned with a recommendation to remove them when they are no longer needed.
+- Plugin checksum verification targets only active plugin slugs instead of using `--all`.
+- Unavailable/unverified checksum labels and numeric plugin risk scores are now internal-only decision signals and are no longer printed in terminal, Markdown, or JSON reports.
+
 ## [0.3.1] - 2026-09-01
 
 ### Added

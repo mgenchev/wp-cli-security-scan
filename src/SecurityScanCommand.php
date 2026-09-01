@@ -10,7 +10,7 @@ if ( ! defined( 'WP_CLI' ) || ! WP_CLI ) {
 }
 
 class Security_Scan_Command {
-	private const VERSION = '0.3.1';
+	private const VERSION = '0.3.4';
 	private const DB_BATCH_SIZE = 500;
 	private const FILE_CHUNK_SIZE = 524288;
 	private const FILE_CHUNK_OVERLAP = 8192;
@@ -22,6 +22,7 @@ class Security_Scan_Command {
 	private const USER_BURST_THRESHOLD = 5;
 	private const PRIVILEGED_USER_BURST_THRESHOLD = 2;
 	private const PLUGIN_REINSTALL_SCORE_THRESHOLD = 10;
+	private const HTTP_PARALLEL_LIMIT = 6;
 
 	private const SEVERITY_WEIGHT = [
 		'critical' => 4,
@@ -84,6 +85,10 @@ class Security_Scan_Command {
 	private $background_spinner_process = null;
 	private $php_data_flow_analyzer = null;
 	private $plugin_integrity = [];
+	private $active_plugin_files = [];
+	private $inactive_plugins = [];
+	private $active_theme_slugs = [];
+	private $inactive_themes = [];
 
 	/**
 	 * Run a complete security scan.
@@ -234,6 +239,7 @@ class Security_Scan_Command {
 
 		$this->load_rules();
 		$this->initialize_plugin_integrity_inventory();
+		$this->initialize_theme_inventory();
 
 		$skip_core = isset( $assoc_args['skip-core-checksums'] );
 		$skip_plugin_reputation = isset( $assoc_args['skip-plugin-reputation'] );
@@ -244,6 +250,7 @@ class Security_Scan_Command {
 			\WP_CLI::log( '' );
 			\WP_CLI::log( 'Security Scan' );
 			\WP_CLI::log( str_repeat( '─', 40 ) );
+			$this->render_active_scope_notices( $sections );
 		}
 
 		foreach ( $sections as $section ) {
@@ -267,7 +274,7 @@ class Security_Scan_Command {
 					break;
 
 				case 'plugins':
-					$this->scan_directory_stage( 'Plugins', WP_PLUGIN_DIR, false );
+					$this->scan_active_plugins();
 					break;
 
 				case 'mu_plugins':
@@ -275,7 +282,7 @@ class Security_Scan_Command {
 					break;
 
 				case 'themes':
-					$this->scan_directory_stage( 'Themes', get_theme_root(), false );
+					$this->scan_active_themes();
 					break;
 
 				case 'uploads':
@@ -317,6 +324,10 @@ class Security_Scan_Command {
 		$this->include_node_modules = false;
 		$this->php_data_flow_analyzer = null;
 		$this->plugin_integrity = [];
+		$this->active_plugin_files = [];
+		$this->inactive_plugins = [];
+		$this->active_theme_slugs = [];
+		$this->inactive_themes = [];
 	}
 
 	/**
@@ -566,73 +577,179 @@ class Security_Scan_Command {
 		$stage = 'Plugin integrity';
 		$this->stage_start( $stage );
 
-		try {
-			$result = $this->run_wp_cli_process(
-				'plugin verify-checksums --all --strict --format=json',
-				'Scanning plugin integrity...'
+		$urls = [];
+		foreach ( $this->plugin_integrity as $slug => $data ) {
+			if ( 'external' === ( $data['source'] ?? '' ) ) {
+				$this->set_plugin_integrity_status( $slug, 'unavailable' );
+				continue;
+			}
+
+			$version = trim( (string) ( $data['version'] ?? '' ) );
+			if ( '' === $version ) {
+				$this->set_plugin_integrity_status( $slug, 'unavailable' );
+				continue;
+			}
+
+			$urls[ $slug ] = sprintf(
+				'https://downloads.wordpress.org/plugin-checksums/%s/%s.json',
+				rawurlencode( $slug ),
+				rawurlencode( $version )
 			);
+		}
 
-			$stdout = (string) ( $result->stdout ?? '' );
-			$stderr = (string) ( $result->stderr ?? '' );
-			$output = trim( $stdout . "\n" . $stderr );
-			$checksum_errors = $this->parse_plugin_checksum_json( $stdout );
-			$recognized_problem = false;
+		$responses = $this->fetch_json_urls_parallel( $urls, 'Scanning plugin integrity...' );
+		foreach ( $urls as $slug => $url ) {
+			$response = $responses[ $slug ] ?? null;
+			if (
+				! is_array( $response )
+				|| 200 !== (int) ( $response['code'] ?? 0 )
+				|| ! is_array( $response['json'] ?? null )
+				|| ! isset( $response['json']['files'] )
+				|| ! is_array( $response['json']['files'] )
+			) {
+				$this->set_plugin_integrity_status( $slug, 'unavailable' );
+				continue;
+			}
 
-			foreach ( $checksum_errors as $error ) {
-				$plugin = isset( $error['plugin_name'] ) ? sanitize_key( (string) $error['plugin_name'] ) : '';
-				$file = isset( $error['file'] ) ? ltrim( str_replace( '\\', '/', (string) $error['file'] ), '/' ) : '';
-				$message = isset( $error['message'] ) ? (string) $error['message'] : 'Checksum verification failed';
+			$this->plugin_integrity[ $slug ]['source'] = 'wordpress.org';
+			$this->plugin_integrity[ $slug ]['repository_status'] = 'available';
+			if ( 'known-malicious' !== ( $this->plugin_integrity[ $slug ]['reputation'] ?? '' ) ) {
+				$this->plugin_integrity[ $slug ]['reputation'] = 'known-source';
+			}
 
-				if ( '' === $plugin ) {
+			$this->verify_plugin_checksum_manifest( $slug, $response['json']['files'] );
+		}
+
+		$this->plugin_checksum_stage_finish( $stage );
+	}
+
+	/**
+	 * Compare an installed plugin against an official WordPress.org checksum manifest.
+	 *
+	 * WordPress.org may publish more than one valid hash for a file. We prefer
+	 * SHA-256 and fall back to MD5, mirroring the official WP-CLI checksum logic.
+	 * Missing files from the local copy are not treated as errors because a
+	 * named plugin version can have multiple valid package revisions. Local
+	 * files absent from the manifest are treated as added files.
+	 */
+	private function verify_plugin_checksum_manifest( $slug, array $manifest ) {
+		if ( ! isset( $this->plugin_integrity[ $slug ] ) ) {
+			return;
+		}
+
+		$data = $this->plugin_integrity[ $slug ];
+		$main_file = str_replace( '\\', '/', (string) ( $data['file'] ?? '' ) );
+		$has_directory = false !== strpos( $main_file, '/' );
+		$root = $has_directory
+			? WP_PLUGIN_DIR . DIRECTORY_SEPARATOR . $slug
+			: WP_PLUGIN_DIR;
+
+		if ( ! is_dir( $root ) ) {
+			$this->set_plugin_integrity_status( $slug, 'modified' );
+			$this->plugin_integrity[ $slug ]['checksum_errors'][] = [
+				'file'    => $main_file,
+				'message' => 'Plugin directory is missing',
+			];
+			return;
+		}
+
+		$normalized_manifest = [];
+		foreach ( $manifest as $file => $hashes ) {
+			$file = ltrim( str_replace( '\\', '/', (string) $file ), '/' );
+			$slug_prefix = $slug . '/';
+			if ( 0 === strpos( $file, $slug_prefix ) ) {
+				$file = substr( $file, strlen( $slug_prefix ) );
+			}
+			$normalized_manifest[ $file ] = $hashes;
+		}
+
+		$errors = [];
+		$iterator = new \RecursiveIteratorIterator(
+			new \RecursiveDirectoryIterator( $root, \FilesystemIterator::SKIP_DOTS )
+		);
+
+		foreach ( $iterator as $file_info ) {
+			if ( ! $file_info->isFile() || $file_info->isLink() ) {
+				continue;
+			}
+
+			$absolute = $file_info->getPathname();
+			$relative = ltrim( str_replace( '\\', '/', substr( $absolute, strlen( $root ) ) ), '/' );
+			if ( ! $has_directory ) {
+				if ( $relative !== basename( $main_file ) ) {
 					continue;
 				}
-
-				$recognized_problem = true;
-				$is_regular_plugin = $this->ensure_regular_plugin_integrity_entry( $plugin );
-				if ( $is_regular_plugin ) {
-					$this->set_plugin_integrity_status( $plugin, 'modified' );
-					$this->plugin_integrity[ $plugin ]['checksum_errors'][] = [
-						'file'    => $file,
-						'message' => $message,
-					];
-				}
-
-				$location = ( $is_regular_plugin ? 'plugins/' : 'mu-plugins/' ) . $plugin;
-				if ( '' !== $file ) {
-					$location .= '/' . $file;
-				}
-
-				$this->add_finding(
-					$stage,
-					'high',
-					98,
-					$location,
-					'plugin_checksum_mismatch',
-					$message
-				);
 			}
 
-			$recognized_problem = $this->parse_plugin_checksum_warnings( $output, $stage ) || $recognized_problem;
-
-			$return_code = isset( $result->return_code ) ? (int) $result->return_code : 1;
-			if ( 0 !== $return_code && ! $recognized_problem && empty( $checksum_errors ) ) {
-				$this->add_finding(
-					$stage,
-					'low',
-					45,
-					'Plugins',
-					'plugin_checksum_error',
-					'Plugin checksum verification could not be classified; affected plugins remain unverified.'
-				);
-			} else {
-				$this->mark_remaining_plugins_verified();
+			if ( ! array_key_exists( $relative, $normalized_manifest ) ) {
+				$errors[] = [ 'file' => $relative, 'message' => 'File was added' ];
+				continue;
 			}
 
-			$this->plugin_checksum_stage_finish( $stage );
-		} catch ( \Throwable $e ) {
-			$this->add_finding( $stage, 'low', 45, 'Plugins', 'plugin_checksum_error', 'Plugin checksum verification could not complete: ' . $e->getMessage() );
-			$this->plugin_checksum_stage_finish( $stage );
+			$hash_sets = $this->normalize_checksum_manifest_entry( $normalized_manifest[ $relative ] );
+			$verified = false;
+
+			if ( ! empty( $hash_sets['sha256'] ) && in_array( 'sha256', hash_algos(), true ) ) {
+				$actual = @hash_file( 'sha256', $absolute );
+				$verified = is_string( $actual ) && in_array( strtolower( $actual ), $hash_sets['sha256'], true );
+			} elseif ( ! empty( $hash_sets['md5'] ) ) {
+				$actual = @md5_file( $absolute );
+				$verified = is_string( $actual ) && in_array( strtolower( $actual ), $hash_sets['md5'], true );
+			}
+
+			if ( ! $verified ) {
+				$errors[] = [ 'file' => $relative, 'message' => 'File does not verify against checksum' ];
+			}
 		}
+
+		$this->plugin_integrity[ $slug ]['checksum_errors'] = $errors;
+		$this->set_plugin_integrity_status( $slug, empty( $errors ) ? 'verified' : 'modified' );
+	}
+
+	/**
+	 * Normalize the flexible WordPress.org checksum manifest entry format.
+	 */
+	private function normalize_checksum_manifest_entry( $entry ) {
+		$result = [ 'sha256' => [], 'md5' => [] ];
+
+		if ( is_string( $entry ) ) {
+			$hash = strtolower( trim( $entry ) );
+			if ( 64 === strlen( $hash ) ) {
+				$result['sha256'][] = $hash;
+			} elseif ( 32 === strlen( $hash ) ) {
+				$result['md5'][] = $hash;
+			}
+			return $result;
+		}
+
+		if ( ! is_array( $entry ) ) {
+			return $result;
+		}
+
+		foreach ( [ 'sha256', 'md5' ] as $algorithm ) {
+			if ( ! array_key_exists( $algorithm, $entry ) ) {
+				continue;
+			}
+
+			$values = is_array( $entry[ $algorithm ] ) ? $entry[ $algorithm ] : [ $entry[ $algorithm ] ];
+			foreach ( $values as $value ) {
+				if ( is_string( $value ) && '' !== trim( $value ) ) {
+					$result[ $algorithm ][] = strtolower( trim( $value ) );
+				}
+			}
+		}
+
+		if ( empty( $result['sha256'] ) && empty( $result['md5'] ) ) {
+			foreach ( $entry as $value ) {
+				$nested = $this->normalize_checksum_manifest_entry( $value );
+				$result['sha256'] = array_merge( $result['sha256'], $nested['sha256'] );
+				$result['md5'] = array_merge( $result['md5'], $nested['md5'] );
+			}
+		}
+
+		$result['sha256'] = array_values( array_unique( $result['sha256'] ) );
+		$result['md5'] = array_values( array_unique( $result['md5'] ) );
+		return $result;
 	}
 
 	/**
@@ -646,21 +763,32 @@ class Security_Scan_Command {
 			}
 		}
 
-		if ( ! function_exists( 'get_plugins' ) ) {
+		if ( ! function_exists( 'get_plugins' ) || ! function_exists( 'is_plugin_active' ) ) {
 			return;
 		}
 
 		foreach ( get_plugins() as $file => $data ) {
+			$file = str_replace( '\\', '/', (string) $file );
 			$slug = $this->plugin_slug_from_main_file( $file );
 			if ( '' === $slug ) {
 				continue;
 			}
 
+			if ( ! is_plugin_active( $file ) ) {
+				$this->inactive_plugins[] = [
+					'slug' => $slug,
+					'name' => isset( $data['Name'] ) ? (string) $data['Name'] : $slug,
+					'file' => $file,
+				];
+				continue;
+			}
+
+			$this->active_plugin_files[ $file ] = true;
 			$this->plugin_integrity[ $slug ] = [
 				'slug'              => $slug,
 				'name'              => isset( $data['Name'] ) ? (string) $data['Name'] : $slug,
 				'version'           => isset( $data['Version'] ) ? (string) $data['Version'] : '',
-				'file'              => str_replace( '\\', '/', (string) $file ),
+				'file'              => $file,
 				'update_uri'        => isset( $data['UpdateURI'] ) ? (string) $data['UpdateURI'] : '',
 				'plugin_uri'        => isset( $data['PluginURI'] ) ? (string) $data['PluginURI'] : '',
 				'status'            => 'unverified',
@@ -668,6 +796,44 @@ class Security_Scan_Command {
 				'repository_status' => 'unknown',
 				'source'            => 'unknown',
 				'reputation'        => 'unverified',
+			];
+		}
+	}
+
+	/**
+	 * Build active/inactive theme inventory.
+	 *
+	 * The active child theme and its parent, when present, are both scanned.
+	 */
+	private function initialize_theme_inventory() {
+		if ( ! function_exists( 'wp_get_themes' ) || ! function_exists( 'wp_get_theme' ) ) {
+			return;
+		}
+
+		$active_theme = wp_get_theme();
+		if ( $active_theme && $active_theme->exists() ) {
+			$stylesheet = (string) $active_theme->get_stylesheet();
+			if ( '' !== $stylesheet ) {
+				$this->active_theme_slugs[ $stylesheet ] = true;
+			}
+
+			$parent = $active_theme->parent();
+			if ( $parent && $parent->exists() ) {
+				$parent_stylesheet = (string) $parent->get_stylesheet();
+				if ( '' !== $parent_stylesheet ) {
+					$this->active_theme_slugs[ $parent_stylesheet ] = true;
+				}
+			}
+		}
+
+		foreach ( wp_get_themes() as $slug => $theme ) {
+			if ( isset( $this->active_theme_slugs[ (string) $slug ] ) ) {
+				continue;
+			}
+
+			$this->inactive_themes[] = [
+				'slug' => (string) $slug,
+				'name' => (string) $theme->get( 'Name' ),
 			];
 		}
 	}
@@ -690,113 +856,6 @@ class Security_Scan_Command {
 
 
 	/**
-	 * Ensure a filesystem plugin directory/file is represented in integrity state.
-	 *
-	 * WP-CLI checksum verification can discover plugin directories whose headers
-	 * are missing or damaged and therefore are absent from get_plugins().
-	 */
-	private function ensure_regular_plugin_integrity_entry( $plugin ) {
-		$plugin = sanitize_key( (string) $plugin );
-		if ( '' === $plugin ) {
-			return false;
-		}
-
-		if ( isset( $this->plugin_integrity[ $plugin ] ) ) {
-			return true;
-		}
-
-		$directory = defined( 'WP_PLUGIN_DIR' ) ? WP_PLUGIN_DIR . DIRECTORY_SEPARATOR . $plugin : '';
-		$single_file = defined( 'WP_PLUGIN_DIR' ) ? WP_PLUGIN_DIR . DIRECTORY_SEPARATOR . $plugin . '.php' : '';
-		if ( ( '' === $directory || ! is_dir( $directory ) ) && ( '' === $single_file || ! is_file( $single_file ) ) ) {
-			return false;
-		}
-
-		$this->plugin_integrity[ $plugin ] = [
-			'slug'              => $plugin,
-			'name'              => $plugin,
-			'version'           => '',
-			'file'              => is_file( $single_file ) ? $plugin . '.php' : $plugin,
-			'update_uri'        => '',
-			'plugin_uri'        => '',
-			'status'            => 'unverified',
-			'checksum_errors'   => [],
-			'repository_status' => 'unknown',
-			'source'            => 'unknown',
-			'reputation'        => 'unverified',
-		];
-
-		return true;
-	}
-
-	/**
-	 * Decode the structured checksum errors printed by WP-CLI.
-	 */
-	private function parse_plugin_checksum_json( $output ) {
-		$output = trim( (string) $output );
-		if ( '' === $output ) {
-			return [];
-		}
-
-		$start = strpos( $output, '[' );
-		$end = strrpos( $output, ']' );
-		if ( false === $start || false === $end || $end < $start ) {
-			return [];
-		}
-
-		$data = json_decode( substr( $output, $start, $end - $start + 1 ), true );
-		return is_array( $data ) ? $data : [];
-	}
-
-	/**
-	 * Parse checksum warnings that represent unavailable or incomplete verification.
-	 */
-	private function parse_plugin_checksum_warnings( $output, $stage ) {
-		$recognized = false;
-
-		foreach ( preg_split( '/\\R+/', (string) $output ) as $line ) {
-			$line = $this->strip_wp_cli_prefix( trim( $line ) );
-			if ( '' === $line ) {
-				continue;
-			}
-
-			if ( preg_match( '/Could not retrieve the checksums for version .*? of plugin ([a-z0-9._-]+), skipping\\.?/i', $line, $matches ) ) {
-				$recognized = true;
-				$plugin = sanitize_key( $matches[1] );
-				if ( $this->ensure_regular_plugin_integrity_entry( $plugin ) ) {
-					$this->set_plugin_integrity_status( $plugin, 'unavailable' );
-				}
-				continue;
-			}
-
-			if ( preg_match( '/Could not retrieve the version for plugin ([a-z0-9._-]+), skipping\\.?/i', $line, $matches ) ) {
-				$recognized = true;
-				$plugin = sanitize_key( $matches[1] );
-				if ( $this->ensure_regular_plugin_integrity_entry( $plugin ) ) {
-					$this->set_plugin_integrity_status( $plugin, 'unavailable' );
-				}
-				continue;
-			}
-
-			if ( preg_match( '/Plugin ([a-z0-9._-]+) main file is missing:\\s*(.+)$/i', $line, $matches ) ) {
-				$recognized = true;
-				$plugin = sanitize_key( $matches[1] );
-				$this->ensure_regular_plugin_integrity_entry( $plugin );
-				$this->set_plugin_integrity_status( $plugin, 'modified' );
-				$this->add_finding(
-					$stage,
-					'high',
-					98,
-					'plugins/' . $plugin . '/' . ltrim( str_replace( '\\', '/', $matches[2] ), '/' ),
-					'plugin_checksum_missing_main_file',
-					'Plugin main file is missing'
-				);
-			}
-		}
-
-		return $recognized;
-	}
-
-	/**
 	 * Update a plugin integrity status without downgrading a stronger state.
 	 */
 	private function set_plugin_integrity_status( $plugin, $status ) {
@@ -814,17 +873,6 @@ class Security_Scan_Command {
 		$current = $this->plugin_integrity[ $plugin ]['status'];
 		if ( ( $priority[ $status ] ?? 0 ) >= ( $priority[ $current ] ?? 0 ) ) {
 			$this->plugin_integrity[ $plugin ]['status'] = $status;
-		}
-	}
-
-	/**
-	 * Plugins that produced neither checksum errors nor skip warnings verified successfully.
-	 */
-	private function mark_remaining_plugins_verified() {
-		foreach ( $this->plugin_integrity as $slug => $data ) {
-			if ( 'unverified' === $data['status'] ) {
-				$this->plugin_integrity[ $slug ]['status'] = 'verified';
-			}
 		}
 	}
 
@@ -867,7 +915,12 @@ class Security_Scan_Command {
 			}
 		}
 
-		return function_exists( 'get_plugins' ) ? get_plugins() : [];
+		if ( ! function_exists( 'get_plugins' ) ) {
+			return [];
+		}
+
+		$plugins = get_plugins();
+		return array_intersect_key( $plugins, $this->active_plugin_files );
 	}
 
 	/**
@@ -960,7 +1013,7 @@ class Security_Scan_Command {
 			}
 
 			foreach ( $response[ $bucket ] as $plugin_file => $metadata ) {
-				$known_files[] = str_replace( '\\\\', '/', (string) $plugin_file );
+				$known_files[] = str_replace( '\\', '/', (string) $plugin_file );
 			}
 		}
 
@@ -982,24 +1035,13 @@ class Security_Scan_Command {
 	 * Probe only unresolved slugs individually for closed/disabled status.
 	 */
 	private function probe_unresolved_plugin_repository_status() {
-		if ( ! function_exists( 'wp_remote_get' ) ) {
-			return;
-		}
-
-		$unresolved = [];
+		$urls = [];
 		foreach ( $this->plugin_integrity as $slug => $data ) {
-			if ( 'unknown' === ( $data['repository_status'] ?? 'unknown' ) ) {
-				$unresolved[] = $slug;
-			}
-		}
-
-		$total = count( $unresolved );
-		foreach ( $unresolved as $index => $slug ) {
-			if ( $this->interactive ) {
-				$this->render_spinner( sprintf( 'Checking plugin reputation... %d/%d', $index + 1, $total ) );
+			if ( 'unknown' !== ( $data['repository_status'] ?? 'unknown' ) ) {
+				continue;
 			}
 
-			$url = 'https://api.wordpress.org/plugins/info/1.2/?' . http_build_query(
+			$urls[ $slug ] = 'https://api.wordpress.org/plugins/info/1.2/?' . http_build_query(
 				[
 					'action'  => 'plugin_information',
 					'request' => [
@@ -1013,15 +1055,19 @@ class Security_Scan_Command {
 					],
 				]
 			);
+		}
 
-			$response = wp_remote_get( $url, [ 'timeout' => 5 ] );
-			if ( is_wp_error( $response ) ) {
+		$responses = $this->fetch_json_urls_parallel( $urls, 'Checking plugin reputation...' );
+		foreach ( $urls as $slug => $url ) {
+			$response = $responses[ $slug ] ?? null;
+			if ( ! is_array( $response ) ) {
 				continue;
 			}
 
-			$code = (int) wp_remote_retrieve_response_code( $response );
-			$body = json_decode( (string) wp_remote_retrieve_body( $response ), true );
-			$status = $this->classify_plugin_information_response( $code, $body );
+			$status = $this->classify_plugin_information_response(
+				(int) ( $response['code'] ?? 0 ),
+				is_array( $response['json'] ?? null ) ? $response['json'] : null
+			);
 
 			if ( 'available' === $status ) {
 				$this->plugin_integrity[ $slug ]['source'] = 'wordpress.org';
@@ -1055,6 +1101,160 @@ class Security_Scan_Command {
 				}
 			}
 		}
+	}
+
+	/**
+	 * Fetch multiple JSON URLs concurrently when cURL multi is available.
+	 *
+	 * TLS verification is never disabled. The sequential WordPress HTTP API is
+	 * used as a compatibility fallback.
+	 */
+	private function fetch_json_urls_parallel( array $urls, $spinner_message ) {
+		if ( empty( $urls ) ) {
+			return [];
+		}
+
+		if ( ! function_exists( 'curl_multi_init' ) || ! function_exists( 'curl_init' ) ) {
+			return $this->fetch_json_urls_sequential( $urls, $spinner_message );
+		}
+
+		$multi = curl_multi_init();
+		if ( false === $multi ) {
+			return $this->fetch_json_urls_sequential( $urls, $spinner_message );
+		}
+
+		$queue = [];
+		foreach ( $urls as $key => $url ) {
+			$queue[] = [ 'key' => $key, 'url' => $url ];
+		}
+
+		$active = [];
+		$results = [];
+		$total = count( $queue );
+		$completed = 0;
+		$offset = 0;
+
+		$add_next = function () use ( &$queue, &$offset, &$active, $multi ) {
+			if ( ! isset( $queue[ $offset ] ) ) {
+				return false;
+			}
+
+			$item = $queue[ $offset++ ];
+			$handle = curl_init();
+			curl_setopt_array(
+				$handle,
+				[
+					CURLOPT_URL            => $item['url'],
+					CURLOPT_RETURNTRANSFER => true,
+					CURLOPT_FOLLOWLOCATION => false,
+					CURLOPT_CONNECTTIMEOUT => 8,
+					CURLOPT_TIMEOUT        => 20,
+					CURLOPT_SSL_VERIFYPEER => true,
+					CURLOPT_SSL_VERIFYHOST => 2,
+					CURLOPT_ENCODING       => '',
+					CURLOPT_USERAGENT      => 'WP-CLI Security Scan/' . self::VERSION,
+				]
+			);
+			curl_multi_add_handle( $multi, $handle );
+			$handle_id = is_object( $handle ) ? spl_object_id( $handle ) : (int) $handle;
+			$active[ $handle_id ] = [ 'handle' => $handle, 'key' => $item['key'] ];
+			return true;
+		};
+
+		while ( count( $active ) < self::HTTP_PARALLEL_LIMIT && $add_next() ) {
+		}
+
+		do {
+			do {
+				$status = curl_multi_exec( $multi, $running );
+			} while ( CURLM_CALL_MULTI_PERFORM === $status );
+
+			while ( $info = curl_multi_info_read( $multi ) ) {
+				$handle = $info['handle'];
+				$id = is_object( $handle ) ? spl_object_id( $handle ) : (int) $handle;
+				$item = $active[ $id ] ?? null;
+				if ( null === $item ) {
+					continue;
+				}
+
+				$body = curl_multi_getcontent( $handle );
+				$code = (int) curl_getinfo( $handle, CURLINFO_HTTP_CODE );
+				$results[ $item['key'] ] = [
+					'code'  => $code,
+					'body'  => is_string( $body ) ? $body : '',
+					'json'  => is_string( $body ) ? json_decode( $body, true ) : null,
+					'error' => CURLE_OK === (int) $info['result'] ? '' : curl_error( $handle ),
+				];
+
+				curl_multi_remove_handle( $multi, $handle );
+				curl_close( $handle );
+				unset( $active[ $id ] );
+				$completed++;
+				while ( count( $active ) < self::HTTP_PARALLEL_LIMIT && $add_next() ) {
+				}
+			}
+
+			if ( $this->interactive ) {
+				$this->render_spinner( sprintf( '%s %d/%d', $spinner_message, $completed, $total ) );
+			}
+
+			if ( $running > 0 ) {
+				$selected = curl_multi_select( $multi, 0.15 );
+				if ( -1 === $selected ) {
+					usleep( 10000 );
+				}
+			}
+		} while ( $running > 0 || ! empty( $active ) );
+
+		curl_multi_close( $multi );
+
+		$retry_urls = [];
+		foreach ( $urls as $key => $url ) {
+			if ( ! isset( $results[ $key ] ) || ( 0 === (int) ( $results[ $key ]['code'] ?? 0 ) && '' !== (string) ( $results[ $key ]['error'] ?? '' ) ) ) {
+				$retry_urls[ $key ] = $url;
+			}
+		}
+
+		if ( ! empty( $retry_urls ) ) {
+			$retry_results = $this->fetch_json_urls_sequential( $retry_urls, $spinner_message );
+			foreach ( $retry_results as $key => $result ) {
+				$results[ $key ] = $result;
+			}
+		}
+
+		return $results;
+	}
+
+	/**
+	 * Sequential compatibility fallback for JSON HTTP requests.
+	 */
+	private function fetch_json_urls_sequential( array $urls, $spinner_message ) {
+		$results = [];
+		$total = count( $urls );
+		$index = 0;
+
+		foreach ( $urls as $key => $url ) {
+			$index++;
+			if ( $this->interactive ) {
+				$this->render_spinner( sprintf( '%s %d/%d', $spinner_message, $index, $total ) );
+			}
+
+			$response = wp_remote_get( $url, [ 'timeout' => 20, 'user-agent' => 'WP-CLI Security Scan/' . self::VERSION ] );
+			if ( is_wp_error( $response ) ) {
+				$results[ $key ] = [ 'code' => 0, 'body' => '', 'json' => null, 'error' => $response->get_error_message() ];
+				continue;
+			}
+
+			$body = (string) wp_remote_retrieve_body( $response );
+			$results[ $key ] = [
+				'code'  => (int) wp_remote_retrieve_response_code( $response ),
+				'body'  => $body,
+				'json'  => json_decode( $body, true ),
+				'error' => '',
+			];
+		}
+
+		return $results;
 	}
 
 	/**
@@ -1151,19 +1351,13 @@ class Security_Scan_Command {
 		}
 
 		$this->clear_spinner();
-		$summary = sprintf(
-			'%d WordPress.org, %d external, %d unknown',
-			$counts['wordpress.org'],
-			$counts['external'],
-			$counts['unknown']
-		);
+		$risk_count = max( $findings, $counts['risky'] );
+		$icon = 0 === $risk_count ? '✓' : '⚠';
+		$status = 0 === $risk_count
+			? 'no threats found'
+			: sprintf( '%d threat%s found', $risk_count, 1 === $risk_count ? '' : 's' );
 
-		if ( $findings > 0 || $counts['risky'] > 0 ) {
-			\WP_CLI::log( '⚠ Plugin reputation checked — ' . $summary . ', ' . max( $findings, $counts['risky'] ) . ' risk signal' . ( 1 === max( $findings, $counts['risky'] ) ? '' : 's' ) . ' found' );
-			return;
-		}
-
-		\WP_CLI::log( '✓ Plugin reputation checked — ' . $summary . ', no reputation warnings found' );
+		\WP_CLI::log( sprintf( '%s Plugin reputation checked — %s', $icon, $status ) );
 	}
 
 	/**
@@ -1184,42 +1378,18 @@ class Security_Scan_Command {
 			}
 		}
 
-		$findings = $this->count_stage_findings( $stage );
 		if ( isset( $this->stage_stats[ $stage ] ) ) {
 			$this->stage_stats[ $stage ]['items'] = null;
-			$this->stage_stats[ $stage ]['findings'] = $findings;
+			$this->stage_stats[ $stage ]['findings'] = 0;
 			$this->stage_stats[ $stage ]['verified_plugins'] = $counts['verified'];
 			$this->stage_stats[ $stage ]['modified_plugins'] = $counts['modified'];
 			$this->stage_stats[ $stage ]['unavailable_plugins'] = $counts['unavailable'];
 			$this->stage_stats[ $stage ]['unverified_plugins'] = $counts['unverified'];
 		}
 
-		if ( ! $this->interactive ) {
-			return;
+		if ( $this->interactive ) {
+			$this->clear_spinner();
 		}
-
-		$this->clear_spinner();
-		$parts = [];
-		if ( $counts['verified'] > 0 ) {
-			$parts[] = $counts['verified'] . ' verified';
-		}
-		if ( $counts['unavailable'] > 0 ) {
-			$parts[] = $counts['unavailable'] . ' unavailable';
-		}
-		if ( $counts['unverified'] > 0 ) {
-			$parts[] = $counts['unverified'] . ' unverified';
-		}
-		if ( $counts['modified'] > 0 ) {
-			$parts[] = $counts['modified'] . ' modified';
-		}
-		$status_text = empty( $parts ) ? 'no plugins detected' : implode( ', ', $parts );
-
-		if ( 0 === $findings && 0 === $counts['modified'] ) {
-			\WP_CLI::log( '✓ ' . $stage . ' completed — ' . $status_text . ', no integrity mismatches found' );
-			return;
-		}
-
-		\WP_CLI::log( '⚠ ' . $stage . ' completed — ' . $status_text . ', ' . $findings . ' integrity issue' . ( 1 === $findings ? '' : 's' ) . ' found' );
 	}
 
 	/**
@@ -1251,6 +1421,120 @@ class Security_Scan_Command {
 		);
 
 		return new \RecursiveIteratorIterator( $filter, \RecursiveIteratorIterator::SELF_FIRST );
+	}
+
+	/**
+	 * Print the active-only plugin/theme scan scope.
+	 */
+	private function render_active_scope_notices( array $sections ) {
+		$show_plugins = (bool) array_intersect( [ 'plugin_reputation', 'plugin_checksums', 'plugins' ], $sections );
+		$show_themes = in_array( 'themes', $sections, true );
+
+		if ( $show_plugins ) {
+			\WP_CLI::log( 'Plugin scope: active plugins only.' );
+		}
+
+		if ( $show_themes ) {
+			\WP_CLI::log( 'Theme scope: active theme and parent theme only, when applicable.' );
+		}
+
+		if ( $show_plugins || $show_themes ) {
+			\WP_CLI::log( '' );
+		}
+	}
+
+	/**
+	 * Scan active regular plugins only.
+	 */
+	private function scan_active_plugins() {
+		$stage = 'Plugins';
+		$this->stage_start( $stage );
+		$count = 0;
+		$roots = [];
+
+		foreach ( $this->plugin_integrity as $data ) {
+			$main_file = str_replace( '/', DIRECTORY_SEPARATOR, (string) ( $data['file'] ?? '' ) );
+			if ( '' === $main_file ) {
+				continue;
+			}
+
+			$relative_dir = dirname( $main_file );
+			$root = '.' === $relative_dir
+				? WP_PLUGIN_DIR . DIRECTORY_SEPARATOR . $main_file
+				: WP_PLUGIN_DIR . DIRECTORY_SEPARATOR . $relative_dir;
+			$roots[ $this->normalize_path( $root ) ] = $root;
+		}
+
+		foreach ( $roots as $root ) {
+			if ( is_file( $root ) ) {
+				$count++;
+				$this->scanned_files++;
+				$this->stage_tick( $stage, $count, 'files' );
+				$this->scan_file( $stage, $root, false );
+				continue;
+			}
+
+			if ( ! is_dir( $root ) ) {
+				continue;
+			}
+
+			$iterator = $this->create_scan_iterator( $root );
+			foreach ( $iterator as $item ) {
+				if ( $item->isLink() ) {
+					$this->scan_symlink( $stage, $item->getPathname() );
+					continue;
+				}
+				if ( ! $item->isFile() ) {
+					continue;
+				}
+
+				$count++;
+				$this->scanned_files++;
+				$this->stage_tick( $stage, $count, 'files' );
+				$this->scan_file( $stage, $item->getPathname(), false );
+			}
+		}
+
+		$this->stage_finish( $stage, $count, $this->count_reportable_plugin_findings() );
+	}
+
+	/**
+	 * Scan the active theme and its parent theme only.
+	 */
+	private function scan_active_themes() {
+		$stage = 'Themes';
+		$this->stage_start( $stage );
+		$count = 0;
+
+		foreach ( array_keys( $this->active_theme_slugs ) as $slug ) {
+			$theme = wp_get_theme( $slug );
+			if ( ! $theme || ! $theme->exists() ) {
+				continue;
+			}
+
+			$root = get_theme_root( $slug ) . DIRECTORY_SEPARATOR . $slug;
+			if ( ! is_dir( $root ) ) {
+				continue;
+			}
+
+			$iterator = $this->create_scan_iterator( $root );
+			foreach ( $iterator as $item ) {
+				if ( $item->isLink() ) {
+					$this->scan_symlink( $stage, $item->getPathname() );
+					continue;
+				}
+				if ( ! $item->isFile() ) {
+					continue;
+				}
+
+				$count++;
+				$this->scanned_files++;
+				$this->stage_tick( $stage, $count, 'files' );
+				$this->scan_file( $stage, $item->getPathname(), false );
+			}
+		}
+
+		$this->stage_finish( $stage, $count, $this->count_stage_findings( $stage ) );
 	}
 
 	/**
@@ -2449,7 +2733,7 @@ class Security_Scan_Command {
 		$this->clear_spinner();
 		$icon = 0 === $findings ? '✓' : '⚠';
 		$suffix = 0 === $findings ? 'no threats found' : sprintf( '%d threat%s found', $findings, 1 === $findings ? '' : 's' );
-		\WP_CLI::log( sprintf( '%s %s scanned — %s %s, %s', $icon, $stage, number_format( $count ), $unit, $suffix ) );
+		\WP_CLI::log( sprintf( '%s %s scanned — %s', $icon, $stage, $suffix ) );
 	}
 
 	/**
@@ -2648,6 +2932,9 @@ PHP;
 			}
 		}
 
+		$report_stages = $this->stage_stats;
+		unset( $report_stages['Plugin integrity'] );
+
 		return [
 			'package_version'   => self::VERSION,
 			'scanned_at'        => gmdate( 'c' ),
@@ -2657,8 +2944,7 @@ PHP;
 			'administrator_users' => $this->admin_count,
 			'severity'          => $severity_counts,
 			'total_findings'    => count( $findings ),
-			'stages'            => $this->stage_stats,
-			'plugin_integrity'  => $this->plugin_integrity,
+			'stages'            => $report_stages,
 			'findings'          => $findings,
 		];
 	}
@@ -2669,7 +2955,6 @@ PHP;
 	private function order_report_sections( array $sections ) {
 		$order = [
 			'Core checksums',
-			'Plugin integrity',
 			'Themes',
 			'Plugins',
 			'MU plugins & drop-ins',
@@ -2708,6 +2993,10 @@ PHP;
 		$filtered = [];
 
 		foreach ( $findings as $finding ) {
+			if ( 'Plugin integrity' === $finding['section'] ) {
+				continue;
+			}
+
 			if ( 'Plugins' !== $finding['section'] ) {
 				$filtered[] = $finding;
 				continue;
@@ -2939,14 +3228,13 @@ PHP;
 	}
 
 	/**
-	 * Build a finding location relative to the plugin directory where possible.
+	 * Build a wp-content-relative plugin finding location.
+	 *
+	 * Keep the plugins/<slug>/ prefix visible so findings are immediately
+	 * understandable when copied out of the grouped plugin report.
 	 */
 	private function plugin_relative_finding_location( array $finding, $plugin ) {
-		$location = str_replace( '\\', '/', (string) $finding['location'] );
-		$prefix = 'plugins/' . $plugin . '/';
-		if ( 0 === stripos( $location, $prefix ) ) {
-			$location = substr( $location, strlen( $prefix ) );
-		}
+		$location = ltrim( str_replace( '\\', '/', (string) $finding['location'] ), '/' );
 
 		if ( ! empty( $finding['line'] ) ) {
 			$location .= ':' . $finding['line'];
@@ -2971,54 +3259,210 @@ PHP;
 	}
 
 	/**
+	 * Count checksum changes recorded for a plugin.
+	 */
+	private function plugin_integrity_change_count( $plugin ) {
+		if ( ! isset( $this->plugin_integrity[ $plugin ]['checksum_errors'] ) ) {
+			return 0;
+		}
+
+		return count( (array) $this->plugin_integrity[ $plugin ]['checksum_errors'] );
+	}
+
+	/**
+	 * Build remediation recommendations after plugin findings have been analyzed.
+	 *
+	 * Recommendations are intentionally separated from individual findings so a
+	 * high-volume plugin does not bury the action the operator should take.
+	 */
+	private function plugin_recommendations( array $groups ) {
+		$recommendations = [];
+
+		foreach ( $groups as $group ) {
+			$slug = $group['slug'];
+			if ( 'reinstall' === $group['action'] ) {
+				$reason = 'modified' === $group['integrity']
+					? 'Plugin integrity verification failed.'
+					: 'Multiple suspicious findings exceeded the replacement threshold.';
+
+				$recommendations[ $slug ] = [
+					'slug'   => $slug,
+					'action' => 'reinstall',
+					'reason' => $reason,
+					'count'  => max( (int) $group['total'], $this->plugin_integrity_change_count( $slug ) ),
+				];
+				continue;
+			}
+
+			$reason = 'verified' === $group['integrity']
+				? 'Independent plugin-risk signals remain despite verified checksums.'
+				: 'Grouped suspicious findings require manual review.';
+
+			$recommendations[ $slug ] = [
+				'slug'   => $slug,
+				'action' => 'review',
+				'reason' => $reason,
+				'count'  => (int) $group['total'],
+			];
+		}
+
+		foreach ( $this->plugin_integrity as $slug => $data ) {
+			if ( 'modified' !== ( $data['status'] ?? '' ) || isset( $recommendations[ $slug ] ) ) {
+				continue;
+			}
+
+			$recommendations[ $slug ] = [
+				'slug'   => $slug,
+				'action' => 'reinstall',
+				'reason' => 'Plugin integrity verification failed.',
+				'count'  => $this->plugin_integrity_change_count( $slug ),
+			];
+		}
+
+		$recommendations = array_values( $recommendations );
+		usort(
+			$recommendations,
+			static function ( $a, $b ) {
+				$rank = [ 'reinstall' => 2, 'review' => 1 ];
+				$action_compare = ( $rank[ $b['action'] ] ?? 0 ) <=> ( $rank[ $a['action'] ] ?? 0 );
+				if ( 0 !== $action_compare ) {
+					return $action_compare;
+				}
+
+				return strcmp( $a['slug'], $b['slug'] );
+			}
+		);
+
+		return $recommendations;
+	}
+
+	/**
+	 * Render all plugin remediation recommendations at the end of the section.
+	 */
+	private function render_terminal_plugin_recommendations( array $groups ) {
+		$recommendations = $this->plugin_recommendations( $groups );
+		$has_inactive_plugins = ! empty( $this->inactive_plugins );
+		$has_inactive_themes = ! empty( $this->inactive_themes );
+
+		if ( empty( $recommendations ) && ! $has_inactive_plugins && ! $has_inactive_themes ) {
+			return;
+		}
+
+		\WP_CLI::log( '' );
+		\WP_CLI::log( 'Recommendations' );
+		\WP_CLI::log( str_repeat( '─', 40 ) );
+
+		foreach ( $recommendations as $recommendation ) {
+			\WP_CLI::log( '⚠ ' . $recommendation['slug'] );
+			if ( 'reinstall' === $recommendation['action'] ) {
+				\WP_CLI::log( '  Replace the entire plugin with a fresh trusted copy, then rescan.' );
+			} else {
+				\WP_CLI::log( '  Manually review the grouped findings.' );
+			}
+			\WP_CLI::log( '' );
+		}
+
+		if ( $has_inactive_plugins ) {
+			$count = count( $this->inactive_plugins );
+			\WP_CLI::log(
+				sprintf(
+					'⚠ %d inactive plugin%s detected — not scanned; remove %s if not needed.',
+					$count,
+					1 === $count ? '' : 's',
+					1 === $count ? 'it' : 'them'
+				)
+			);
+			\WP_CLI::log( '' );
+		}
+
+		if ( $has_inactive_themes ) {
+			$count = count( $this->inactive_themes );
+			\WP_CLI::log(
+				sprintf(
+					'⚠ %d inactive theme%s detected — not scanned; remove %s if not needed.',
+					$count,
+					1 === $count ? '' : 's',
+					1 === $count ? 'it' : 'them'
+				)
+			);
+		}
+	}
+
+	/**
+	 * Build Markdown remediation recommendations.
+	 */
+	private function render_markdown_plugin_recommendations( array $groups ) {
+		$recommendations = $this->plugin_recommendations( $groups );
+		$has_inactive_plugins = ! empty( $this->inactive_plugins );
+		$has_inactive_themes = ! empty( $this->inactive_themes );
+
+		if ( empty( $recommendations ) && ! $has_inactive_plugins && ! $has_inactive_themes ) {
+			return [];
+		}
+
+		$lines = [ '## Recommendations', '' ];
+		foreach ( $recommendations as $recommendation ) {
+			if ( 'reinstall' === $recommendation['action'] ) {
+				$lines[] = '- ⚠ **`' . $this->markdown_escape( $recommendation['slug'] ) . '`** — Replace the entire plugin with a fresh trusted copy, then rescan.';
+			} else {
+				$lines[] = '- ⚠ **`' . $this->markdown_escape( $recommendation['slug'] ) . '`** — Manually review the grouped findings.';
+			}
+		}
+
+		if ( $has_inactive_plugins ) {
+			$count = count( $this->inactive_plugins );
+			$lines[] = '- ⚠ ' . $count . ' inactive plugin' . ( 1 === $count ? '' : 's' ) . ' detected — not scanned; remove ' . ( 1 === $count ? 'it' : 'them' ) . ' if not needed.';
+		}
+
+		if ( $has_inactive_themes ) {
+			$count = count( $this->inactive_themes );
+			$lines[] = '- ⚠ ' . $count . ' inactive theme' . ( 1 === $count ? '' : 's' ) . ' detected — not scanned; remove ' . ( 1 === $count ? 'it' : 'them' ) . ' if not needed.';
+		}
+
+		$lines[] = '';
+		return $lines;
+	}
+
+	/**
 	 * Render plugin findings in a compact plugin -> issue -> file hierarchy.
+	 *
+	 * Plugins that already crossed the replacement threshold are intentionally
+	 * omitted from the verbose finding list; their remediation is shown once in
+	 * the Recommendations block at the end of the Plugins section.
 	 */
 	private function render_terminal_plugin_findings( array $findings ) {
 		$groups = $this->group_plugin_findings( $findings );
 		$plugin_count = count( $groups );
-		\WP_CLI::log(
-			sprintf(
-				'%d threat%s found across %d plugin%s',
-				count( $findings ),
-				1 === count( $findings ) ? '' : 's',
-				$plugin_count,
-				1 === $plugin_count ? '' : 's'
-			)
-		);
-		\WP_CLI::log( '' );
 
-		foreach ( $groups as $group ) {
-			\WP_CLI::log( $group['slug'] );
-			$summary = $this->plugin_severity_summary( $group );
+		if ( $plugin_count > 0 ) {
 			\WP_CLI::log(
 				sprintf(
-					'  %d finding%s%s',
-					$group['total'],
-					1 === $group['total'] ? '' : 's',
-					'' !== $summary ? ' · ' . $summary : ''
+					'%d threat%s found across %d plugin%s',
+					count( $findings ),
+					1 === count( $findings ) ? '' : 's',
+					$plugin_count,
+					1 === $plugin_count ? '' : 's'
 				)
 			);
+			\WP_CLI::log( '' );
+		} else {
+			\WP_CLI::log( 'No reportable static plugin findings.' );
+			\WP_CLI::log( '' );
+		}
 
-			$source_label = 'wordpress.org' === $group['source'] ? 'WordPress.org' : ucfirst( $group['source'] );
-			\WP_CLI::log( '  Source: ' . $source_label );
-
-			if ( 'verified' === $group['integrity'] ) {
-				\WP_CLI::log( '  ✓ Checksums verified — only independent plugin-risk signals are shown.' );
-				\WP_CLI::log( '  ⚠ Recommendation: review the plugin status/source; reinstalling the same verified version may not change these findings.' );
-			} elseif ( 'modified' === $group['integrity'] ) {
-				\WP_CLI::log( '  ⚠ Checksums failed.' );
-				\WP_CLI::log( '  ⚠ Strong recommendation: replace the entire plugin with a fresh trusted copy, then rescan.' );
-			} else {
-				$status_label = 'unavailable' === $group['integrity'] ? 'unavailable' : 'unverified';
-				\WP_CLI::log( '  ? Checksums ' . $status_label . '.' );
-				\WP_CLI::log( sprintf( '  Risk score: %d / %d', $group['risk_score'], self::PLUGIN_REINSTALL_SCORE_THRESHOLD ) );
-
-				if ( 'reinstall' === $group['action'] ) {
-					\WP_CLI::log( '  ⚠ Strong recommendation: replace the entire plugin with a fresh trusted copy, then rescan.' );
-				} else {
-					\WP_CLI::log( '  ⚠ Recommendation: manually review the grouped findings.' );
-				}
+		foreach ( $groups as $group ) {
+			if ( 'reinstall' === $group['action'] ) {
+				continue;
 			}
+
+			\WP_CLI::log( $group['slug'] );
+			\WP_CLI::log(
+				sprintf(
+					'  %d finding%s',
+					$group['total'],
+					1 === $group['total'] ? '' : 's'
+				)
+			);
 			\WP_CLI::log( '' );
 
 			foreach ( $group['issues'] as $issue ) {
@@ -3040,6 +3484,9 @@ PHP;
 
 	/**
 	 * Render plugin findings for the Markdown report.
+	 *
+	 * Markdown remains the detailed human-readable export, so it preserves all
+	 * grouped paths even for plugins that are ultimately recommended for replace.
 	 */
 	private function render_markdown_plugin_findings( array $findings ) {
 		$lines = [];
@@ -3048,30 +3495,13 @@ PHP;
 		$lines[] = '';
 
 		foreach ( $groups as $group ) {
+			if ( 'reinstall' === $group['action'] ) {
+				continue;
+			}
+
 			$lines[] = '### `' . $this->markdown_escape( $group['slug'] ) . '`';
 			$lines[] = '';
-			$summary = $this->plugin_severity_summary( $group );
-			$lines[] = $group['total'] . ' finding' . ( 1 === $group['total'] ? '' : 's' ) . ( '' !== $summary ? ' — ' . $summary : '' ) . '.';
-			$lines[] = '';
-
-			$source_label = 'wordpress.org' === $group['source'] ? 'WordPress.org' : ucfirst( $group['source'] );
-			$lines[] = '- Source: **' . $this->markdown_escape( $source_label ) . '**.';
-
-			if ( 'verified' === $group['integrity'] ) {
-				$lines[] = '- ✓ Checksums verified; ordinary static findings are suppressed.';
-				$lines[] = '- ⚠ These are independent plugin-risk signals. Review the plugin status/source; reinstalling the same verified version may not change them.';
-			} elseif ( 'modified' === $group['integrity'] ) {
-				$lines[] = '- ⚠ Checksums failed.';
-				$lines[] = '- ⚠ **Strong recommendation:** Replace the entire plugin with a fresh trusted copy, then rescan.';
-			} else {
-				$lines[] = '- ? Checksums ' . ( 'unavailable' === $group['integrity'] ? 'unavailable' : 'unverified' ) . '.';
-				$lines[] = '- Risk score: **' . $group['risk_score'] . ' / ' . self::PLUGIN_REINSTALL_SCORE_THRESHOLD . '**.';
-				if ( 'reinstall' === $group['action'] ) {
-					$lines[] = '- ⚠ **Strong recommendation:** Replace the entire plugin with a fresh trusted copy, then rescan.';
-				} else {
-					$lines[] = '- ⚠ Manual review recommended.';
-				}
-			}
+			$lines[] = $group['total'] . ' finding' . ( 1 === $group['total'] ? '' : 's' ) . '.';
 			$lines[] = '';
 
 			foreach ( $group['issues'] as $issue ) {
@@ -3096,7 +3526,11 @@ PHP;
 	}
 
 	/**
-	 * Render checksum failures grouped by plugin with direct remediation.
+	 * Render checksum failures grouped by plugin.
+	 *
+	 * Modified plugins are already direct replacement candidates, so the terminal
+	 * report keeps this section concise and moves remediation to the end of the
+	 * Plugins section. Raw checksum details remain available in JSON/Markdown.
 	 */
 	private function render_terminal_plugin_integrity_findings( array $findings ) {
 		$groups = [];
@@ -3108,20 +3542,21 @@ PHP;
 			$groups[ $plugin ][] = $finding;
 		}
 
-		\WP_CLI::log( sprintf( '%d integrity issue%s found', count( $findings ), 1 === count( $findings ) ? '' : 's' ) );
+		\WP_CLI::log( sprintf( '%d integrity issue%s found across %d plugin%s', count( $findings ), 1 === count( $findings ) ? '' : 's', count( $groups ), 1 === count( $groups ) ? '' : 's' ) );
 		\WP_CLI::log( '' );
 
 		foreach ( $groups as $plugin => $plugin_findings ) {
 			\WP_CLI::log( $plugin );
 			if ( 'modified' === $this->plugin_integrity_status( $plugin ) ) {
-				\WP_CLI::log( '  ⚠ Strong recommendation: replace the entire plugin with a fresh trusted copy, then rescan.' );
+				\WP_CLI::log( sprintf( '  %d integrity change%s detected.', count( $plugin_findings ), 1 === count( $plugin_findings ) ? '' : 's' ) );
+				\WP_CLI::log( '' );
+				continue;
 			}
-		\WP_CLI::log( '' );
 
 			foreach ( $plugin_findings as $finding ) {
 				$label = strtoupper( $finding['severity'] ) . ' · ' . $finding['confidence'] . '%';
-			\WP_CLI::log( sprintf( '  %-16s %s', $label, $finding['description'] ) );
-			\WP_CLI::log( str_repeat( ' ', 19 ) . $this->plugin_relative_finding_location( $finding, $plugin ) );
+				\WP_CLI::log( sprintf( '  %-16s %s', $label, $finding['description'] ) );
+				\WP_CLI::log( str_repeat( ' ', 19 ) . $this->plugin_relative_finding_location( $finding, $plugin ) );
 			}
 			\WP_CLI::log( '' );
 		}
@@ -3129,6 +3564,9 @@ PHP;
 
 	/**
 	 * Render plugin checksum failures for Markdown.
+	 *
+	 * The detailed export keeps every affected path. Recommendations are rendered
+	 * once at the end of the Plugins section.
 	 */
 	private function render_markdown_plugin_integrity_findings( array $findings ) {
 		$lines = [];
@@ -3146,10 +3584,6 @@ PHP;
 		foreach ( $groups as $plugin => $plugin_findings ) {
 			$lines[] = '### `' . $this->markdown_escape( $plugin ) . '`';
 			$lines[] = '';
-			if ( 'modified' === $this->plugin_integrity_status( $plugin ) ) {
-				$lines[] = '> ⚠ **Strong recommendation:** Replace the entire plugin with a fresh trusted copy, then rescan.';
-				$lines[] = '';
-			}
 			foreach ( $plugin_findings as $finding ) {
 				$lines[] = '- **' . strtoupper( $finding['severity'] ) . ' · ' . $finding['confidence'] . '%** — ' . $this->markdown_escape( $finding['description'] );
 				$lines[] = '  - `' . $this->markdown_escape( $this->plugin_relative_finding_location( $finding, $plugin ) ) . '`';
@@ -3178,6 +3612,15 @@ PHP;
 			$sections['Database'] = [];
 		}
 
+		if ( ! isset( $sections['Plugins'] ) ) {
+			foreach ( $this->plugin_integrity as $plugin_data ) {
+				if ( 'modified' === ( $plugin_data['status'] ?? '' ) ) {
+					$sections['Plugins'] = [];
+					break;
+				}
+			}
+		}
+
 		if ( empty( $sections ) ) {
 			\WP_CLI::success( 'No suspicious findings matched the active rules.' );
 		} else {
@@ -3193,18 +3636,10 @@ PHP;
 					continue;
 				}
 
-				if ( 'Plugin integrity' === $section ) {
-					$this->render_terminal_plugin_integrity_findings( $findings );
-					continue;
-				}
-
 				if ( 'Core checksums' === $section ) {
 					\WP_CLI::log( sprintf( '%d integrity issue%s found', count( $findings ), 1 === count( $findings ) ? '' : 's' ) );
 				} else {
 					\WP_CLI::log( sprintf( '%d threat%s found', count( $findings ), 1 === count( $findings ) ? '' : 's' ) );
-				}
-				if ( 'Database' === $section && isset( $report['stages']['Database']['items'] ) ) {
-					\WP_CLI::log( sprintf( '%s rows scanned', number_format( $report['stages']['Database']['items'] ) ) );
 				}
 				\WP_CLI::log( '' );
 
@@ -3225,7 +3660,7 @@ PHP;
 		\WP_CLI::log( str_repeat( '─', 40 ) );
 
 		$summary_stages = [
-			'Checksums' => [ 'Core checksums', 'Plugin integrity' ],
+			'Checksums' => [ 'Core checksums' ],
 			'Themes'    => [ 'Themes' ],
 			'Plugins'   => [ 'Plugins' ],
 			'Uploads'   => [ 'Uploads' ],
@@ -3274,8 +3709,6 @@ PHP;
 		\WP_CLI::log( sprintf( '  Admin users      %s', number_format( $report['administrator_users'] ) ) );
 		\WP_CLI::log( sprintf( '  Threats found    %s', number_format( $report['total_findings'] ) ) );
 		\WP_CLI::log( sprintf( '  Scan time        %.2fs', $report['duration_seconds'] ) );
-
-
 		\WP_CLI::log( str_repeat( '─', 40 ) );
 
 		if ( $report['severity']['critical'] > 0 || $report['severity']['high'] > 0 ) {
@@ -3283,6 +3716,16 @@ PHP;
 		} else {
 			\WP_CLI::success( 'Security scan completed.' );
 		}
+
+		$plugin_findings = array_values(
+			array_filter(
+				$report['findings'],
+				static function ( $finding ) {
+					return 'Plugins' === ( $finding['section'] ?? '' );
+				}
+			)
+		);
+		$this->render_terminal_plugin_recommendations( $this->group_plugin_findings( $plugin_findings ) );
 	}
 
 	/**
@@ -3296,7 +3739,7 @@ PHP;
 		$lines[] = '';
 
 		$summary_stages = [
-			'Checksums' => [ 'Core checksums', 'Plugin integrity' ],
+			'Checksums' => [ 'Core checksums' ],
 			'Themes'    => [ 'Themes' ],
 			'Plugins'   => [ 'Plugins' ],
 			'Uploads'   => [ 'Uploads' ],
@@ -3354,8 +3797,16 @@ PHP;
 			$sections['Database'] = [];
 		}
 
-		$sections = $this->order_report_sections( $sections );
+		if ( ! isset( $sections['Plugins'] ) ) {
+			foreach ( $this->plugin_integrity as $plugin_data ) {
+				if ( 'modified' === ( $plugin_data['status'] ?? '' ) ) {
+					$sections['Plugins'] = [];
+					break;
+				}
+			}
+		}
 
+		$sections = $this->order_report_sections( $sections );
 		foreach ( $sections as $section => $findings ) {
 			$lines[] = '## ' . $section;
 			$lines[] = '';
@@ -3365,19 +3816,10 @@ PHP;
 				continue;
 			}
 
-			if ( 'Plugin integrity' === $section ) {
-				$lines = array_merge( $lines, $this->render_markdown_plugin_integrity_findings( $findings ) );
-				continue;
-			}
-
 			if ( 'Core checksums' === $section ) {
 				$lines[] = count( $findings ) . ' integrity issue' . ( 1 === count( $findings ) ? '' : 's' ) . ' found.';
 			} else {
 				$lines[] = count( $findings ) . ' threat' . ( 1 === count( $findings ) ? '' : 's' ) . ' found.';
-			}
-			if ( 'Database' === $section && isset( $report['stages']['Database']['items'] ) ) {
-				$lines[] = '';
-				$lines[] = $report['stages']['Database']['items'] . ' database rows scanned.';
 			}
 			$lines[] = '';
 
@@ -3403,6 +3845,15 @@ PHP;
 			$lines[] = '';
 		}
 
+		$plugin_findings = array_values(
+			array_filter(
+				$report['findings'],
+				static function ( $finding ) {
+					return 'Plugins' === ( $finding['section'] ?? '' );
+				}
+			)
+		);
+		$lines = array_merge( $lines, $this->render_markdown_plugin_recommendations( $this->group_plugin_findings( $plugin_findings ) ) );
 
 		return implode( PHP_EOL, $lines ) . PHP_EOL;
 	}
