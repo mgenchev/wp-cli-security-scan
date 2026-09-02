@@ -10,7 +10,7 @@ if ( ! defined( 'WP_CLI' ) || ! WP_CLI ) {
 }
 
 class Security_Scan_Command {
-	private const VERSION = '0.3.8';
+	private const VERSION = '0.3.9';
 	private const DB_BATCH_SIZE = 500;
 	private const FILE_CHUNK_SIZE = 524288;
 	private const FILE_CHUNK_OVERLAP = 8192;
@@ -89,6 +89,7 @@ class Security_Scan_Command {
 	private $inactive_plugins = [];
 	private $active_theme_slugs = [];
 	private $inactive_themes = [];
+	private $launch_directory = '';
 
 	/**
 	 * Run a complete security scan.
@@ -222,6 +223,7 @@ class Security_Scan_Command {
 		$this->include_node_modules = isset( $assoc_args['include-node-modules'] );
 		$this->suppress_wordpress_debug();
 		$this->start_time = microtime( true );
+		$this->launch_directory = $this->resolve_launch_directory();
 
 		if ( $this->interactive ) {
 			$this->start_background_spinner( 'Security Scan — loading WordPress...' );
@@ -249,7 +251,7 @@ class Security_Scan_Command {
 			$this->clear_spinner();
 			\WP_CLI::log( '' );
 			\WP_CLI::log( 'Security Scan' );
-			\WP_CLI::log( str_repeat( '─', 40 ) );
+			\WP_CLI::log( str_repeat( '-', 50 ) );
 			$this->render_active_scope_notices( $sections );
 		}
 
@@ -328,6 +330,7 @@ class Security_Scan_Command {
 		$this->inactive_plugins = [];
 		$this->active_theme_slugs = [];
 		$this->inactive_themes = [];
+		$this->launch_directory = '';
 	}
 
 	/**
@@ -672,6 +675,11 @@ class Security_Scan_Command {
 			if ( ! $file_info->isFile() || $file_info->isLink() ) {
 				continue;
 			}
+
+			$current_count = isset( $this->stage_stats['Plugin integrity']['items'] )
+				? (int) $this->stage_stats['Plugin integrity']['items'] + 1
+				: 1;
+			$this->stage_tick( 'Plugin integrity', $current_count, 'files' );
 
 			$absolute = $file_info->getPathname();
 			$relative = ltrim( str_replace( '\\', '/', substr( $absolute, strlen( $root ) ) ), '/' );
@@ -1236,10 +1244,16 @@ class Security_Scan_Command {
 		foreach ( $urls as $key => $url ) {
 			$index++;
 			if ( $this->interactive ) {
-				$this->render_spinner( sprintf( '%s %d/%d', $spinner_message, $index, $total ) );
+				$this->start_background_spinner( sprintf( '%s %d/%d', $spinner_message, $index, $total ) );
 			}
 
-			$response = wp_remote_get( $url, [ 'timeout' => 20, 'user-agent' => 'WP-CLI Security Scan/' . self::VERSION ] );
+			try {
+				$response = wp_remote_get( $url, [ 'timeout' => 20, 'user-agent' => 'WP-CLI Security Scan/' . self::VERSION ] );
+			} finally {
+				if ( $this->interactive ) {
+					$this->stop_background_spinner();
+				}
+			}
 			if ( is_wp_error( $response ) ) {
 				$results[ $key ] = [ 'code' => 0, 'body' => '', 'json' => null, 'error' => $response->get_error_message() ];
 				continue;
@@ -1387,9 +1401,29 @@ class Security_Scan_Command {
 			$this->stage_stats[ $stage ]['unverified_plugins'] = $counts['unverified'];
 		}
 
-		if ( $this->interactive ) {
-			$this->clear_spinner();
+		if ( ! $this->interactive ) {
+			return;
 		}
+
+		$this->clear_spinner();
+		$has_integrity_warning = ( $counts['modified'] + $counts['unavailable'] + $counts['unverified'] ) > 0;
+		$icon = $has_integrity_warning ? '⚠' : '✓';
+		$parts = [];
+		if ( $counts['verified'] > 0 ) {
+			$parts[] = sprintf( '%d verified', $counts['verified'] );
+		}
+		if ( $counts['modified'] > 0 ) {
+			$parts[] = sprintf( '%d modified', $counts['modified'] );
+		}
+		if ( $counts['unavailable'] > 0 ) {
+			$parts[] = sprintf( '%d unavailable', $counts['unavailable'] );
+		}
+		if ( $counts['unverified'] > 0 ) {
+			$parts[] = sprintf( '%d unverified', $counts['unverified'] );
+		}
+
+		$status = empty( $parts ) ? 'no eligible plugins' : implode( ', ', $parts );
+		\WP_CLI::log( sprintf( '%s Plugin integrity checked — %s', $icon, $status ) );
 	}
 
 	/**
@@ -3375,6 +3409,57 @@ PHP;
 	}
 
 	/**
+	 * Group findings by their human-readable problem while preserving locations.
+	 *
+	 * Core checksum findings intentionally share a rule ID for multiple checksum
+	 * outcomes, so grouping them by rule would merge distinct problems.
+	 */
+	private function group_findings_by_problem( array $findings ) {
+		$groups = [];
+		foreach ( $findings as $finding ) {
+			$key = (string) ( $finding['description'] ?? '' );
+			if ( ! isset( $groups[ $key ] ) ) {
+				$groups[ $key ] = [
+					'description' => $key,
+					'severity'    => (string) $finding['severity'],
+					'confidence'  => (int) $finding['confidence'],
+					'findings'    => [],
+				];
+			}
+
+			$groups[ $key ]['findings'][] = $finding;
+			if (
+				self::SEVERITY_WEIGHT[ $finding['severity'] ] > self::SEVERITY_WEIGHT[ $groups[ $key ]['severity'] ]
+				|| (
+					$finding['severity'] === $groups[ $key ]['severity']
+					&& (int) $finding['confidence'] > (int) $groups[ $key ]['confidence']
+				)
+			) {
+				$groups[ $key ]['severity'] = (string) $finding['severity'];
+				$groups[ $key ]['confidence'] = (int) $finding['confidence'];
+			}
+		}
+
+		$groups = array_values( $groups );
+		usort(
+			$groups,
+			static function ( $a, $b ) {
+				$severity_compare = self::SEVERITY_WEIGHT[ $b['severity'] ] <=> self::SEVERITY_WEIGHT[ $a['severity'] ];
+				if ( 0 !== $severity_compare ) {
+					return $severity_compare;
+				}
+				$confidence_compare = $b['confidence'] <=> $a['confidence'];
+				if ( 0 !== $confidence_compare ) {
+					return $confidence_compare;
+				}
+				return strcmp( $a['description'], $b['description'] );
+			}
+		);
+
+		return $groups;
+	}
+
+	/**
 	 * Build a complete finding location with source line when available.
 	 */
 	private function finding_location( array $finding ) {
@@ -3553,7 +3638,7 @@ PHP;
 
 		\WP_CLI::log( '' );
 		\WP_CLI::log( 'Recommendations' );
-		\WP_CLI::log( str_repeat( '─', 40 ) );
+		\WP_CLI::log( str_repeat( '-', 50 ) );
 
 		if ( ! empty( $buckets['integrity'] ) ) {
 			\WP_CLI::log( 'HIGH PRIORITY — Plugin integrity verification failed' );
@@ -3839,7 +3924,7 @@ PHP;
 		\WP_CLI::log( '' );
 		\WP_CLI::log( '' );
 		\WP_CLI::log( 'Summary' );
-		\WP_CLI::log( str_repeat( '─', 40 ) );
+		\WP_CLI::log( str_repeat( '-', 50 ) );
 
 		$summary_stages = [
 			'Checksums' => [ 'Core checksums' ],
@@ -3891,7 +3976,7 @@ PHP;
 		\WP_CLI::log( sprintf( '  Admin users      %s', number_format( $report['administrator_users'] ) ) );
 		\WP_CLI::log( sprintf( '  Threats found    %s', number_format( $report['total_findings'] ) ) );
 		\WP_CLI::log( sprintf( '  Scan time        %.2fs', $report['duration_seconds'] ) );
-		\WP_CLI::log( str_repeat( '─', 40 ) );
+		\WP_CLI::log( str_repeat( '-', 50 ) );
 		\WP_CLI::success( 'Security scan completed.' );
 
 		$plugin_findings = array_values(
@@ -4055,8 +4140,8 @@ PHP;
 	 * Write a complete human-readable scan log, replacing the previous scan log.
 	 */
 	private function write_scan_log( array $report ) {
-		$root = defined( 'ABSPATH' ) ? rtrim( ABSPATH, '/\\' ) : getcwd();
-		$path = $root . DIRECTORY_SEPARATOR . 'security-scan.log';
+		$directory = '' !== $this->launch_directory ? $this->launch_directory : $this->resolve_launch_directory();
+		$path = rtrim( $directory, '/\\' ) . DIRECTORY_SEPARATOR . 'security-scan.log';
 		$content = $this->render_scan_log( $report );
 		if ( false === @file_put_contents( $path, $content, LOCK_EX ) ) {
 			return null;
@@ -4065,17 +4150,48 @@ PHP;
 	}
 
 	/**
+	 * Resolve the directory from which the WP-CLI process was launched.
+	 *
+	 * WP-CLI can change the PHP working directory while resolving --path. The
+	 * shell-provided PWD value therefore takes precedence when it points to a
+	 * real directory, with getcwd() as a portable fallback.
+	 */
+	private function resolve_launch_directory() {
+		$candidates = [];
+		$pwd = getenv( 'PWD' );
+		if ( is_string( $pwd ) && '' !== trim( $pwd ) ) {
+			$candidates[] = $pwd;
+		}
+		if ( isset( $_SERVER['PWD'] ) && is_string( $_SERVER['PWD'] ) && '' !== trim( $_SERVER['PWD'] ) ) {
+			$candidates[] = $_SERVER['PWD'];
+		}
+		$cwd = getcwd();
+		if ( is_string( $cwd ) && '' !== $cwd ) {
+			$candidates[] = $cwd;
+		}
+
+		foreach ( array_unique( $candidates ) as $candidate ) {
+			$real = realpath( $candidate );
+			if ( false !== $real && is_dir( $real ) ) {
+				return $real;
+			}
+		}
+
+		return defined( 'ABSPATH' ) ? rtrim( ABSPATH, '/\\' ) : '.';
+	}
+
+	/**
 	 * Build a detailed plain-text report intended for manual incident review.
 	 */
 	private function render_scan_log( array $report ) {
 		$lines = [];
-		$lines[] = str_repeat( '=', 80 );
+		$lines[] = str_repeat( '-', 80 );
 		$lines[] = 'WORDPRESS SECURITY SCAN';
-		$lines[] = str_repeat( '=', 80 );
+		$lines[] = str_repeat( '-', 80 );
 		$lines[] = sprintf( '%-16s %s', 'Scanned at:', ( $report['scanned_at'] ?? gmdate( 'c' ) ) );
-		$lines[] = '';
+		$this->append_scan_log_major_section_gap( $lines );
 		$lines[] = 'SUMMARY';
-		$lines[] = str_repeat( '=', 80 );
+		$lines[] = str_repeat( '-', 80 );
 		$lines[] = 'Severity';
 		$lines[] = sprintf( '  %-14s %s', 'CRITICAL', number_format( (int) $report['severity']['critical'] ) );
 		$lines[] = sprintf( '  %-14s %s', 'HIGH', number_format( (int) $report['severity']['high'] ) );
@@ -4087,9 +4203,9 @@ PHP;
 		$lines[] = sprintf( '  %-22s %s', 'Database rows scanned', number_format( (int) $report['database_rows'] ) );
 		$lines[] = sprintf( '  %-22s %s', 'Administrator users', number_format( (int) $report['administrator_users'] ) );
 		$lines[] = sprintf( '  %-22s %s', 'Reportable findings', number_format( (int) $report['total_findings'] ) );
-		$lines[] = '';
+		$this->append_scan_log_major_section_gap( $lines );
 		$lines[] = 'FINDINGS';
-		$lines[] = str_repeat( '=', 80 );
+		$lines[] = str_repeat( '-', 80 );
 
 		$sections = [];
 		foreach ( $report['findings'] as $finding ) {
@@ -4142,6 +4258,11 @@ PHP;
 					$this->append_scan_log_issue( $lines, $issue, $issue_number );
 					$issue_number++;
 				}
+			} elseif ( 'Core checksums' === $section ) {
+				foreach ( $this->group_findings_by_problem( $findings ) as $issue ) {
+					$this->append_scan_log_issue( $lines, $issue, $issue_number );
+					$issue_number++;
+				}
 			} else {
 				foreach ( $findings as $finding ) {
 					$issue = [
@@ -4168,8 +4289,9 @@ PHP;
 		);
 		$recommendations = $this->plugin_recommendations( $this->group_plugin_findings( $plugin_findings ) );
 		if ( ! empty( $recommendations ) || ! empty( $this->inactive_plugins ) || ! empty( $this->inactive_themes ) ) {
+			$this->append_scan_log_major_section_gap( $lines );
 			$lines[] = 'RECOMMENDATIONS';
-			$lines[] = str_repeat( '=', 80 );
+			$lines[] = str_repeat( '-', 80 );
 			foreach ( $recommendations as $recommendation ) {
 				$lines[] = sprintf( '[%s] %s', strtoupper( $recommendation['action'] ), $recommendation['slug'] );
 				$lines[] = '  Reason: ' . $recommendation['reason'];
@@ -4190,6 +4312,18 @@ PHP;
 		}
 
 		return implode( PHP_EOL, $lines ) . PHP_EOL;
+	}
+
+	/**
+	 * Keep exactly two blank lines between top-level scan-log sections.
+	 */
+	private function append_scan_log_major_section_gap( array &$lines ) {
+		while ( ! empty( $lines ) && '' === end( $lines ) ) {
+			array_pop( $lines );
+		}
+
+		$lines[] = '';
+		$lines[] = '';
 	}
 
 	/**

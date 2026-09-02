@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.3.9] - 2026-09-02
+
+### Changed
+
+- Plugin integrity now keeps an explicit completed-status line in the live scan checklist, updates the spinner while local files are hashed, and keeps the spinner animated during blocking sequential HTTP fallbacks.
+- `security-scan.log` is now written to the directory from which the WP-CLI scan was launched instead of always using the WordPress root.
+- Core checksum log findings are grouped by checksum problem while preserving every affected path.
+- Scan-log main sections use consistent extra spacing and portable ASCII hyphen separators; terminal separators use ASCII hyphens as well.
+
 ## [0.3.8] - 2026-09-02
 
 ### Changed

@@ -39,7 +39,10 @@ if ( false === strpos( $stage_output, '⚠ Plugins scanned — 4 threats found' 
 
 $plugin_integrity = new ReflectionProperty( $command, 'plugin_integrity' );
 $plugin_integrity->setAccessible( true );
-$plugin_integrity->setValue( $command, [ 'sample' => [ 'status' => 'modified' ] ] );
+$plugin_integrity->setValue( $command, [
+	'good-plugin' => [ 'status' => 'verified' ],
+	'bad-plugin' => [ 'status' => 'modified' ],
+] );
 $stage_stats->setValue( $command, [ 'Plugin integrity' => [ 'items' => 0, 'findings' => 0 ] ] );
 $finish_integrity = new ReflectionMethod( $command, 'plugin_checksum_stage_finish' );
 $finish_integrity->setAccessible( true );
@@ -47,8 +50,8 @@ WP_CLI::$logs = [];
 ob_start();
 $finish_integrity->invoke( $command, 'Plugin integrity' );
 ob_end_clean();
-if ( ! empty( WP_CLI::$logs ) ) {
-	fwrite( STDERR, "Plugin integrity completion must remain internal-only.\n" );
+if ( false === strpos( implode( "\n", WP_CLI::$logs ), '⚠ Plugin integrity checked — 1 verified, 1 modified' ) ) {
+	fwrite( STDERR, "Plugin integrity completion must remain visible in the scan checklist.\n" );
 	exit( 1 );
 }
 
@@ -84,11 +87,6 @@ $output = implode( "\n", WP_CLI::$logs );
 
 if ( 1 !== substr_count( $output, '184,158' ) || false === strpos( $output, 'DB rows scanned  184,158' ) ) {
 	fwrite( STDERR, "Database row count must appear only in Summary.\n" );
-	exit( 1 );
-}
-
-if ( false !== strpos( $output, 'Plugin integrity' ) ) {
-	fwrite( STDERR, "Plugin integrity must not appear in the human-readable report.\n" );
 	exit( 1 );
 }
 

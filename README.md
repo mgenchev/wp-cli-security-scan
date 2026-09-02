@@ -123,11 +123,12 @@ After WordPress loads, the staged flow continues with a single updating status l
 ⠸ Scanning plugins... 1,842 files
 ```
 
-Completed stages remain visible, but completion lines intentionally show only findings rather than repeating how many files/rows were processed. Plugin integrity remains an internal remediation signal and does not get its own completed-status line:
+Completed stages remain visible. Normal scan stages show findings rather than repeating file/row totals, while plugin integrity keeps a concise completed-status line with verification states so the checklist remains clear during long scans:
 
 ```text
 ✓ Core checksums completed — no integrity issues found
 ✓ Plugin reputation checked — no threats found
+⚠ Plugin integrity checked — 12 verified, 1 unavailable
 ⚠ Plugins scanned — 3 threats found
 ✓ Uploads scanned — no threats found
 ⠋ Scanning database... 18,500 rows
@@ -183,7 +184,7 @@ REVIEW — Suspicious plugin findings require manual review
 CLEANUP — Inactive code is not scanned
   ⚠ 5 inactive plugins detected — not scanned; remove them if not needed.
 
-Detailed findings saved to /path/to/wordpress/security-scan.log
+Detailed findings saved to /path/from/which/the/scan/was/run/security-scan.log
 ```
 
 Detailed findings are intentionally not printed in the interactive terminal report. File-content findings, affected paths and source lines are preserved in `security-scan.log`; filename-only, checksum, symlink, and database findings may not have a line number.
@@ -317,7 +318,7 @@ When a plugin reaches the replacement threshold, its long per-file list is omitt
 
 ```text
 Recommendations
-────────────────────────────────────────
+--------------------------------------------------
 ⚠ suspicious-premium-plugin
   Replace the entire plugin with a fresh trusted copy, then rescan.
 
@@ -429,4 +430,4 @@ Legitimate variable-variable assignments such as `$$key = $value` are not report
 
 ### Automatic scan log
 
-Every completed scan overwrites `security-scan.log` in the WordPress root. The log is intended for manual incident review and uses separate Summary, Findings, and Recommendations blocks. Findings use a compact numbered layout showing severity, confidence, the problem, and every affected path/line. Repeated Uploads/plugin issues remain grouped where the existing grouping preserves the full evidence. Plugin checksum/integrity changes are grouped by problem so added files and checksum mismatches can be reviewed together while preserving every affected plugin path. Interactive scans print the log path after the final Recommendations block so the detailed evidence is easy to locate.
+Every completed scan overwrites `security-scan.log` in the directory from which the scan was launched. The log is intended for manual incident review and uses separate Summary, Findings, and Recommendations blocks. Findings use a compact numbered layout showing severity, confidence, the problem, and every affected path/line. Repeated Uploads/plugin issues remain grouped where the existing grouping preserves the full evidence. Core checksum findings are grouped by checksum problem while retaining every affected core path. Plugin checksum/integrity changes are grouped by problem so added files and checksum mismatches can be reviewed together while preserving every affected plugin path. Interactive scans print the log path after the final Recommendations block so the detailed evidence is easy to locate.

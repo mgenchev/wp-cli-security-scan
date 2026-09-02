@@ -14,6 +14,9 @@ class WP_CLI {
 require dirname( __DIR__ ) . '/src/SecurityScanCommand.php';
 @mkdir( ABSPATH, 0777, true );
 $command = new Security_Scan_Command();
+$launch_directory = new ReflectionProperty( $command, 'launch_directory' );
+$launch_directory->setAccessible( true );
+$launch_directory->setValue( $command, rtrim( ABSPATH, DIRECTORY_SEPARATOR ) );
 $integrity = new ReflectionProperty( $command, 'plugin_integrity' );
 $integrity->setAccessible( true );
 $integrity->setValue( $command, [
@@ -47,21 +50,31 @@ if ( false === strpos( implode("\n", WP_CLI::$logs), 'bad-plugin' ) ) {
 	fwrite( STDERR, "Modified plugin list is missing.\n" ); exit(1);
 }
 
+$core = [
+	[ 'section'=>'Core checksums','severity'=>'high','confidence'=>96,'description'=>"File doesn't verify against checksum",'location'=>'wp-includes/a.php','line'=>null,'rule'=>'core_checksum_mismatch' ],
+	[ 'section'=>'Core checksums','severity'=>'high','confidence'=>96,'description'=>"File doesn't verify against checksum",'location'=>'wp-includes/b.php','line'=>null,'rule'=>'core_checksum_mismatch' ],
+	[ 'section'=>'Core checksums','severity'=>'high','confidence'=>96,'description'=>'File should not exist','location'=>'wp-admin/extra.php','line'=>null,'rule'=>'core_checksum_mismatch' ],
+];
 $report = [
 	'scanned_at'=>gmdate('c'),'duration_seconds'=>1.2,
-	'severity'=>['critical'=>0,'high'=>2,'medium'=>0,'low'=>0],
-	'files_scanned'=>2,'database_rows'=>0,'administrator_users'=>1,'total_findings'=>2,
-	'stages'=>['Uploads'=>['findings'=>2]],'findings'=>$uploads,
+	'severity'=>['critical'=>0,'high'=>5,'medium'=>0,'low'=>0],
+	'files_scanned'=>5,'database_rows'=>0,'administrator_users'=>1,'total_findings'=>5,
+	'stages'=>['Core checksums'=>['findings'=>3],'Uploads'=>['findings'=>2]],'findings'=>array_merge( $core, $uploads ),
 ];
 $log = new ReflectionMethod( $command, 'write_scan_log' );
 $log->setAccessible( true );
 $path = $log->invoke( $command, $report );
 if ( ! is_string( $path ) || ! is_file( $path ) ) { fwrite(STDERR,"Scan log was not written.\n"); exit(1); }
+if ( realpath( dirname( $path ) ) !== realpath( rtrim( ABSPATH, DIRECTORY_SEPARATOR ) ) ) { fwrite(STDERR,"Scan log must be written to the launch directory.\n"); exit(1); }
 $content = file_get_contents($path);
 if ( false === strpos($content,'uploads/a/index.php') || false === strpos($content,'uploads/b/index.php') ) { fwrite(STDERR,"Scan log must contain all paths.\n"); exit(1); }
 if ( false === strpos( $content, 'FINDINGS' ) || false === strpos( $content, 'UPLOADS (2 findings)' ) ) { fwrite(STDERR,"Scan log must use clear findings section headers.\n"); exit(1); }
 if ( false === strpos( $content, '[1] HIGH | 96% confidence' ) || false === strpos( $content, 'Locations:' ) ) { fwrite(STDERR,"Grouped scan-log issues must expose severity, confidence, and locations.\n"); exit(1); }
 if ( false !== strpos( $content, 'Rule:' ) || false !== strpos( $content, 'Occurrences:' ) || false !== strpos( $content, 'Version:' ) || false !== strpos( $content, 'Duration:' ) ) { fwrite(STDERR,"Scan log must omit version, duration, rule IDs, and occurrence labels.\n"); exit(1); }
 if ( false === strpos( $content, "Plugin integrity changes\n  File does not verify against checksum\n    - plugins/bad-plugin/b.php" ) || false === strpos( $content, "  File was added\n    - plugins/bad-plugin/a.php" ) ) { fwrite(STDERR,"Plugin integrity changes must be grouped by problem while preserving affected paths.\n"); exit(1); }
+
+if ( 1 !== substr_count( $content, "Problem: File doesn't verify against checksum" ) || false === strpos( $content, 'wp-includes/a.php' ) || false === strpos( $content, 'wp-includes/b.php' ) || false === strpos( $content, 'Problem: File should not exist' ) || false === strpos( $content, 'wp-admin/extra.php' ) ) { fwrite(STDERR,"Core checksum findings must be grouped by problem while preserving all affected paths.\n"); exit(1); }
+if ( false === strpos( $content, "\n\nSUMMARY\n" ) || false === strpos( $content, "\n\nFINDINGS\n" ) ) { fwrite(STDERR,"Main scan-log sections must use consistent extra spacing.\n"); exit(1); }
+if ( false !== strpos( $content, '═' ) || false !== strpos( $content, '─' ) ) { fwrite(STDERR,"Scan log separators must use portable ASCII hyphens.\n"); exit(1); }
 @unlink($path); @rmdir(ABSPATH);
 echo "Grouped report smoke tests passed.\n";
