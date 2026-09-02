@@ -10,7 +10,7 @@ if ( ! defined( 'WP_CLI' ) || ! WP_CLI ) {
 }
 
 class Security_Scan_Command {
-	private const VERSION = '0.3.5';
+	private const VERSION = '0.3.6';
 	private const DB_BATCH_SIZE = 500;
 	private const FILE_CHUNK_SIZE = 524288;
 	private const FILE_CHUNK_OVERLAP = 8192;
@@ -2898,7 +2898,7 @@ PHP;
 
 		$this->modification_clusters = $this->build_finding_mtime_clusters( $filtered );
 		$report = $this->build_report( $filtered );
-		$this->write_scan_log( $report );
+		$scan_log_path = $this->write_scan_log( $report );
 		$output_file = isset( $assoc_args['output'] ) ? (string) $assoc_args['output'] : '';
 
 		if ( 'json' === $this->format ) {
@@ -2913,7 +2913,7 @@ PHP;
 			return;
 		}
 
-		$this->render_terminal_report( $report );
+		$this->render_terminal_report( $report, $scan_log_path );
 	}
 
 	/**
@@ -3794,68 +3794,14 @@ PHP;
 	}
 
 	/**
-	 * Render terminal report grouped by section.
+	 * Render the concise terminal report.
+	 *
+	 * Detailed findings are intentionally kept out of the interactive terminal
+	 * report and written to the scan log instead. This keeps the console focused
+	 * on the final summary and remediation actions without discarding evidence.
 	 */
-	private function render_terminal_report( array $report ) {
+	private function render_terminal_report( array $report, $scan_log_path = null ) {
 		\WP_CLI::log( '' );
-		\WP_CLI::log( '' );
-		\WP_CLI::log( 'Findings' );
-		\WP_CLI::log( str_repeat( '═', 72 ) );
-
-		$sections = [];
-		foreach ( $report['findings'] as $finding ) {
-			$sections[ $finding['section'] ][] = $finding;
-		}
-
-		if ( isset( $report['stages']['Database'] ) && ! isset( $sections['Database'] ) ) {
-			$sections['Database'] = [];
-		}
-
-		if ( ! isset( $sections['Plugins'] ) ) {
-			foreach ( $this->plugin_integrity as $plugin_data ) {
-				if ( 'modified' === ( $plugin_data['status'] ?? '' ) ) {
-					$sections['Plugins'] = [];
-					break;
-				}
-			}
-		}
-
-		if ( empty( $sections ) ) {
-			\WP_CLI::success( 'No suspicious findings matched the active rules.' );
-		} else {
-			$sections = $this->order_report_sections( $sections );
-
-			foreach ( $sections as $section => $findings ) {
-				\WP_CLI::log( '' );
-				\WP_CLI::log( $section );
-				\WP_CLI::log( str_repeat( '─', 72 ) );
-
-				if ( 'Plugins' === $section ) {
-					$this->render_terminal_plugin_findings( $findings );
-					$this->render_terminal_plugin_integrity_list();
-					continue;
-				}
-
-				if ( 'Core checksums' === $section ) {
-					\WP_CLI::log( sprintf( '%d integrity issue%s found', count( $findings ), 1 === count( $findings ) ? '' : 's' ) );
-				} else {
-					\WP_CLI::log( sprintf( '%d threat%s found', count( $findings ), 1 === count( $findings ) ? '' : 's' ) );
-				}
-				\WP_CLI::log( '' );
-
-				if ( 'Uploads' === $section ) {
-					$this->render_terminal_grouped_findings( $findings );
-					continue;
-				}
-
-				foreach ( $findings as $finding ) {
-					$label = strtoupper( $finding['severity'] ) . ' · ' . $finding['confidence'] . '%';
-					\WP_CLI::log( sprintf( '%-16s %s', $label, $finding['description'] ) );
-					\WP_CLI::log( str_repeat( ' ', 17 ) . $this->finding_location( $finding ) );
-				}
-			}
-		}
-
 		\WP_CLI::log( '' );
 		\WP_CLI::log( 'Summary' );
 		\WP_CLI::log( str_repeat( '─', 40 ) );
@@ -3911,12 +3857,7 @@ PHP;
 		\WP_CLI::log( sprintf( '  Threats found    %s', number_format( $report['total_findings'] ) ) );
 		\WP_CLI::log( sprintf( '  Scan time        %.2fs', $report['duration_seconds'] ) );
 		\WP_CLI::log( str_repeat( '─', 40 ) );
-
-		if ( $report['severity']['critical'] > 0 || $report['severity']['high'] > 0 ) {
-			\WP_CLI::warning( 'High-confidence security findings require review.' );
-		} else {
-			\WP_CLI::success( 'Security scan completed.' );
-		}
+		\WP_CLI::success( 'Security scan completed.' );
 
 		$plugin_findings = array_values(
 			array_filter(
@@ -3927,6 +3868,13 @@ PHP;
 			)
 		);
 		$this->render_terminal_plugin_recommendations( $this->group_plugin_findings( $plugin_findings ) );
+
+		\WP_CLI::log( '' );
+		if ( is_string( $scan_log_path ) && '' !== $scan_log_path ) {
+			\WP_CLI::log( 'Detailed findings saved to ' . $scan_log_path );
+		} else {
+			\WP_CLI::warning( 'Detailed findings log could not be written.' );
+		}
 	}
 
 	/**

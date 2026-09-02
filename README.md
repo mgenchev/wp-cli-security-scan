@@ -150,24 +150,6 @@ wp security-scan core
 ## Example report
 
 ```text
-Plugins
-------------------------------------------------------------------------
-4 threats found across 1 plugin
-
-premium-plugin
-  2 findings
-
-  HIGH · 91%      Request-controlled dynamic callback
-                   plugins/premium-plugin/includes/a.php:88
-                   plugins/premium-plugin/includes/b.php:102
-
-Uploads
-------------------------------------------------------------------------
-1 threat found
-
-CRITICAL · 99%  PHP code embedded inside a non-PHP upload
-                uploads/2024/08/logo.jpg:1
-
 Summary
 ----------------------------------------
 ✓ Checksums   no integrity issues
@@ -176,21 +158,37 @@ Summary
 ⚠ Uploads     1 threat
 ✓ Database    no threats
 
+  Critical         1
+  High             4
+  Medium           0
+  Low              0
+
+  Files scanned    18,114
+  DB rows scanned  184,158
+  Admin users      2
+  Threats found    5
+  Scan time        2.50s
+----------------------------------------
+Success: Security scan completed.
+
 Recommendations
 ----------------------------------------
-⚠ some-plugin
-  Replace the entire plugin with a fresh trusted copy, then rescan.
+HIGH PRIORITY — Plugin integrity verification failed
+  ⚠ some-plugin
+  Replace these plugins with fresh trusted copies, then rescan.
 
-⚠ premium-plugin
-  Manually review the grouped findings.
+REVIEW — Suspicious plugin findings require manual review
+  ⚠ premium-plugin
 
-⚠ 5 inactive plugins detected — not scanned; remove them if not needed.
+CLEANUP — Inactive code is not scanned
+  ⚠ 5 inactive plugins detected — not scanned; remove them if not needed.
+
+Detailed findings saved to /path/to/wordpress/security-scan.log
 ```
 
+Detailed findings are intentionally not printed in the interactive terminal report. File-content findings, affected paths and source lines are preserved in `security-scan.log`; filename-only, checksum, symlink, and database findings may not have a line number.
 
-File-content findings include the source line when it can be determined, for example `plugins/example/file.php:184`. Filename-only, checksum, symlink, and database findings may not have a line number.
-
-The final summary includes severity counts, files scanned, database rows scanned, administrator count, total findings, and scan duration. The Findings report always includes a Database section when the database stage runs, but the row count is shown only once in the final Summary. Findings are displayed in a fixed order beginning with checksum integrity, followed by themes, plugins, uploads, other wp-content checks, database findings, and persistence checks. Each terminal finding prints the problem first and the affected path/line underneath it for faster review.
+The final terminal summary includes severity counts, files scanned, database rows scanned, administrator count, total findings, and scan duration. Recommendations remain in the console so remediation actions are immediately visible, while the detailed findings log preserves the evidence needed for manual incident review.
 
 
 ## Active-only plugin and theme scope
@@ -431,4 +429,4 @@ Legitimate variable-variable assignments such as `$$key = $value` are not report
 
 ### Automatic scan log
 
-Every completed scan overwrites `security-scan.log` in the WordPress root. The log is intended for manual incident review and contains the detailed findings, grouped upload issues, plugin integrity mismatch details, and recommendations.
+Every completed scan overwrites `security-scan.log` in the WordPress root. The log is intended for manual incident review and contains the detailed findings, grouped upload issues, plugin integrity mismatch details, summary metrics, and recommendations. Interactive scans print the log path after the final Recommendations block so the detailed evidence is easy to locate.

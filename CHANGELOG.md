@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.3.6] - 2026-09-02
+
+### Changed
+
+- Interactive terminal output now keeps detailed Findings out of the console and shows only the final Summary and Recommendations.
+- Detailed reportable findings remain available in the automatically generated `security-scan.log` in the WordPress root.
+- The completed terminal report now points to the detailed findings log path.
+- Removed the generic `High-confidence security findings require review.` warning from the end of scans.
+
 ## [0.3.5] - 2026-09-01
 
 ### Changed

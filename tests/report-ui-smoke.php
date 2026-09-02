@@ -53,6 +53,9 @@ if ( ! empty( WP_CLI::$logs ) ) {
 }
 
 $plugin_integrity->setValue( $command, [] );
+$inactive_plugins = new ReflectionProperty( $command, 'inactive_plugins' );
+$inactive_plugins->setAccessible( true );
+$inactive_plugins->setValue( $command, [ [ 'slug' => 'inactive-example' ] ] );
 $report = [
 	'severity' => [ 'critical' => 0, 'high' => 2, 'medium' => 0, 'low' => 0 ],
 	'files_scanned' => 100,
@@ -76,7 +79,7 @@ $report = [
 $render = new ReflectionMethod( $command, 'render_terminal_report' );
 $render->setAccessible( true );
 WP_CLI::$logs = [];
-$render->invoke( $command, $report );
+$render->invoke( $command, $report, '/var/www/html/security-scan.log' );
 $output = implode( "\n", WP_CLI::$logs );
 
 if ( 1 !== substr_count( $output, '184,158' ) || false === strpos( $output, 'DB rows scanned  184,158' ) ) {
@@ -89,4 +92,24 @@ if ( false !== strpos( $output, 'Plugin integrity' ) ) {
 	exit( 1 );
 }
 
+
+if ( false !== strpos( $output, 'Findings' ) || false !== strpos( $output, 'Upload issue' ) || false !== strpos( $output, 'uploads/a.php' ) || false !== strpos( $output, 'DB issue' ) ) {
+	fwrite( STDERR, "Detailed findings must not be printed in the terminal report.\n" );
+	exit( 1 );
+}
+
+if ( false === strpos( $output, 'Summary' ) || false === strpos( $output, 'Recommendations' ) ) {
+	fwrite( STDERR, "Summary and Recommendations must remain in the terminal report.\n" );
+	exit( 1 );
+}
+
+if ( false !== strpos( $output, 'High-confidence security findings require review.' ) ) {
+	fwrite( STDERR, "The high-confidence terminal warning must not be rendered.\n" );
+	exit( 1 );
+}
+
+if ( false === strpos( $output, 'Detailed findings saved to /var/www/html/security-scan.log' ) ) {
+	fwrite( STDERR, "Terminal report must point to the detailed findings log.\n" );
+	exit( 1 );
+}
 echo "Report UI smoke tests passed.\n";
