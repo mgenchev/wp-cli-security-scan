@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.3.8] - 2026-09-02
+
+### Changed
+
+- Simplified `security-scan.log` metadata by removing the package version and scan duration.
+- Removed rule IDs and occurrence labels from detailed finding entries while preserving severity, confidence, problem descriptions, and all affected locations.
+- Plugin checksum/integrity changes are now grouped by problem, with every affected plugin path retained under the corresponding integrity issue.
+
+## [0.3.7] - 2026-09-02
+
+### Changed
+
+- Reformatted `security-scan.log` as a clearer incident-review report with distinct Summary, Findings, and Recommendations blocks.
+- Findings now use consistent numbered entries with severity, confidence, occurrence counts, and preserved affected locations; repeated Uploads/plugin issues remain grouped where the existing grouping is lossless.
+- Detection rule IDs are included in the detailed log to make triage and regression debugging easier.
+- Plugin checksum/integrity changes are formatted as separate per-plugin file lists with the corresponding integrity message.
+
 ## [0.3.6] - 2026-09-02
 
 ### Changed

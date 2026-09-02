@@ -429,4 +429,4 @@ Legitimate variable-variable assignments such as `$$key = $value` are not report
 
 ### Automatic scan log
 
-Every completed scan overwrites `security-scan.log` in the WordPress root. The log is intended for manual incident review and contains the detailed findings, grouped upload issues, plugin integrity mismatch details, summary metrics, and recommendations. Interactive scans print the log path after the final Recommendations block so the detailed evidence is easy to locate.
+Every completed scan overwrites `security-scan.log` in the WordPress root. The log is intended for manual incident review and uses separate Summary, Findings, and Recommendations blocks. Findings use a compact numbered layout showing severity, confidence, the problem, and every affected path/line. Repeated Uploads/plugin issues remain grouped where the existing grouping preserves the full evidence. Plugin checksum/integrity changes are grouped by problem so added files and checksum mismatches can be reviewed together while preserving every affected plugin path. Interactive scans print the log path after the final Recommendations block so the detailed evidence is easy to locate.

@@ -10,7 +10,7 @@ if ( ! defined( 'WP_CLI' ) || ! WP_CLI ) {
 }
 
 class Security_Scan_Command {
-	private const VERSION = '0.3.6';
+	private const VERSION = '0.3.8';
 	private const DB_BATCH_SIZE = 500;
 	private const FILE_CHUNK_SIZE = 524288;
 	private const FILE_CHUNK_OVERLAP = 8192;
@@ -3271,6 +3271,40 @@ PHP;
 	}
 
 
+
+	/**
+	 * Group plugin checksum changes by problem while preserving every affected path.
+	 */
+	private function group_plugin_integrity_changes_by_problem() {
+		$groups = [];
+
+		foreach ( $this->modified_plugin_slugs() as $slug ) {
+			$errors = (array) ( $this->plugin_integrity[ $slug ]['checksum_errors'] ?? [] );
+			foreach ( $errors as $error ) {
+				$problem = trim( (string) ( $error['message'] ?? '' ) );
+				if ( '' === $problem ) {
+					$problem = 'Integrity mismatch';
+				}
+
+				$file = ltrim( str_replace( '\\', '/', (string) ( $error['file'] ?? '' ) ), '/' );
+				$location = 'plugins/' . $slug;
+				if ( '' !== $file ) {
+					$location .= '/' . $file;
+				}
+
+				$groups[ $problem ][] = $location;
+			}
+		}
+
+		ksort( $groups, SORT_STRING );
+		foreach ( $groups as &$locations ) {
+			sort( $locations, SORT_STRING );
+		}
+		unset( $locations );
+
+		return $groups;
+	}
+
 	/**
 	 * Return plugins whose installed files differ from the official checksum manifest.
 	 */
@@ -3295,6 +3329,7 @@ PHP;
 			$key = ! empty( $finding['rule'] ) ? (string) $finding['rule'] : md5( (string) $finding['description'] );
 			if ( ! isset( $groups[ $key ] ) ) {
 				$groups[ $key ] = [
+					'rule'        => (string) ( $finding['rule'] ?? '' ),
 					'description' => (string) $finding['description'],
 					'severity'    => (string) $finding['severity'],
 					'confidence'  => (int) $finding['confidence'],
@@ -4034,23 +4069,27 @@ PHP;
 	 */
 	private function render_scan_log( array $report ) {
 		$lines = [];
-		$lines[] = 'WordPress Security Scan';
-		$lines[] = str_repeat( '=', 72 );
-		$lines[] = 'Version: ' . self::VERSION;
-		$lines[] = 'Scanned at: ' . ( $report['scanned_at'] ?? gmdate( 'c' ) );
-		$lines[] = 'Duration: ' . ( $report['duration_seconds'] ?? 0 ) . 's';
+		$lines[] = str_repeat( '=', 80 );
+		$lines[] = 'WORDPRESS SECURITY SCAN';
+		$lines[] = str_repeat( '=', 80 );
+		$lines[] = sprintf( '%-16s %s', 'Scanned at:', ( $report['scanned_at'] ?? gmdate( 'c' ) ) );
 		$lines[] = '';
-		$lines[] = 'Summary';
-		$lines[] = str_repeat( '-', 72 );
-		$lines[] = 'Critical: ' . (int) $report['severity']['critical'];
-		$lines[] = 'High: ' . (int) $report['severity']['high'];
-		$lines[] = 'Medium: ' . (int) $report['severity']['medium'];
-		$lines[] = 'Low: ' . (int) $report['severity']['low'];
-		$lines[] = 'Files scanned: ' . number_format( (int) $report['files_scanned'] );
-		$lines[] = 'Database rows scanned: ' . number_format( (int) $report['database_rows'] );
-		$lines[] = 'Administrator users: ' . number_format( (int) $report['administrator_users'] );
-		$lines[] = 'Threats found: ' . number_format( (int) $report['total_findings'] );
+		$lines[] = 'SUMMARY';
+		$lines[] = str_repeat( '=', 80 );
+		$lines[] = 'Severity';
+		$lines[] = sprintf( '  %-14s %s', 'CRITICAL', number_format( (int) $report['severity']['critical'] ) );
+		$lines[] = sprintf( '  %-14s %s', 'HIGH', number_format( (int) $report['severity']['high'] ) );
+		$lines[] = sprintf( '  %-14s %s', 'MEDIUM', number_format( (int) $report['severity']['medium'] ) );
+		$lines[] = sprintf( '  %-14s %s', 'LOW', number_format( (int) $report['severity']['low'] ) );
 		$lines[] = '';
+		$lines[] = 'Scope';
+		$lines[] = sprintf( '  %-22s %s', 'Files scanned', number_format( (int) $report['files_scanned'] ) );
+		$lines[] = sprintf( '  %-22s %s', 'Database rows scanned', number_format( (int) $report['database_rows'] ) );
+		$lines[] = sprintf( '  %-22s %s', 'Administrator users', number_format( (int) $report['administrator_users'] ) );
+		$lines[] = sprintf( '  %-22s %s', 'Reportable findings', number_format( (int) $report['total_findings'] ) );
+		$lines[] = '';
+		$lines[] = 'FINDINGS';
+		$lines[] = str_repeat( '=', 80 );
 
 		$sections = [];
 		foreach ( $report['findings'] as $finding ) {
@@ -4061,74 +4100,118 @@ PHP;
 		}
 		$sections = $this->order_report_sections( $sections );
 
+		if ( empty( $sections ) ) {
+			$lines[] = 'No reportable findings.';
+			$lines[] = '';
+		}
+
 		foreach ( $sections as $section => $findings ) {
-			$lines[] = $section;
-			$lines[] = str_repeat( '-', 72 );
+			$count = count( $findings );
+			$lines[] = sprintf( '%s (%d finding%s)', strtoupper( $section ), $count, 1 === $count ? '' : 's' );
+			$lines[] = str_repeat( '-', 80 );
+
 			if ( 'Plugins' === $section ) {
 				$groups = $this->group_plugin_findings( $findings );
 				foreach ( $groups as $group ) {
-					$lines[] = $group['slug'] . ' — ' . $group['total'] . ' finding' . ( 1 === $group['total'] ? '' : 's' );
+					$lines[] = sprintf( 'Plugin: %s (%d finding%s)', $group['slug'], $group['total'], 1 === $group['total'] ? '' : 's' );
+					$issue_number = 1;
 					foreach ( $group['issues'] as $issue ) {
-						$count = count( $issue['findings'] );
-						$lines[] = '  ' . strtoupper( $issue['severity'] ) . ' · ' . $issue['confidence'] . '%  ' . $issue['description'] . ( $count > 1 ? ' (' . $count . ' occurrences)' : '' );
-						foreach ( $issue['findings'] as $finding ) {
-							$lines[] = '    ' . $this->plugin_relative_finding_location( $finding, $group['slug'] );
-						}
+						$this->append_scan_log_issue( $lines, $issue, $issue_number, '  ', $group['slug'] );
+						$issue_number++;
 					}
 					$lines[] = '';
 				}
 
-				$modified = $this->modified_plugin_slugs();
-				if ( ! empty( $modified ) ) {
-					$lines[] = 'Plugin integrity details';
-					foreach ( $modified as $slug ) {
-						$lines[] = '  ' . $slug;
-						foreach ( (array) ( $this->plugin_integrity[ $slug ]['checksum_errors'] ?? [] ) as $error ) {
-							$file = 'plugins/' . $slug . '/' . ltrim( str_replace( '\\', '/', (string) ( $error['file'] ?? '' ) ), '/' );
-							$lines[] = '    ' . $file . ' — ' . (string) ( $error['message'] ?? 'Integrity mismatch' );
+				$integrity_groups = $this->group_plugin_integrity_changes_by_problem();
+				if ( ! empty( $integrity_groups ) ) {
+					$lines[] = 'Plugin integrity changes';
+					foreach ( $integrity_groups as $problem => $locations ) {
+						$lines[] = '  ' . $problem;
+						foreach ( $locations as $location ) {
+							$lines[] = '    - ' . $location;
 						}
+						$lines[] = '';
 					}
-					$lines[] = '';
 				}
 				continue;
 			}
 
+			$issue_number = 1;
 			if ( 'Uploads' === $section ) {
 				foreach ( $this->group_findings_by_issue( $findings ) as $issue ) {
-					$count = count( $issue['findings'] );
-					$lines[] = strtoupper( $issue['severity'] ) . ' · ' . $issue['confidence'] . '%  ' . $issue['description'] . ( $count > 1 ? ' (' . $count . ' occurrences)' : '' );
-					foreach ( $issue['findings'] as $finding ) {
-						$lines[] = '  ' . $this->finding_location( $finding );
-					}
-					$lines[] = '';
+					$this->append_scan_log_issue( $lines, $issue, $issue_number );
+					$issue_number++;
 				}
-				continue;
-			}
-
-			foreach ( $findings as $finding ) {
-				$lines[] = strtoupper( $finding['severity'] ) . ' · ' . $finding['confidence'] . '%  ' . $finding['description'];
-				$lines[] = '  ' . $this->finding_location( $finding );
+			} else {
+				foreach ( $findings as $finding ) {
+					$issue = [
+						'rule'        => (string) ( $finding['rule'] ?? '' ),
+						'description' => (string) $finding['description'],
+						'severity'    => (string) $finding['severity'],
+						'confidence'  => (int) $finding['confidence'],
+						'findings'    => [ $finding ],
+					];
+					$this->append_scan_log_issue( $lines, $issue, $issue_number );
+					$issue_number++;
+				}
 			}
 			$lines[] = '';
 		}
 
-		$plugin_findings = array_values( array_filter( $report['findings'], static function ( $finding ) { return 'Plugins' === ( $finding['section'] ?? '' ); } ) );
+		$plugin_findings = array_values(
+			array_filter(
+				$report['findings'],
+				static function ( $finding ) {
+					return 'Plugins' === ( $finding['section'] ?? '' );
+				}
+			)
+		);
 		$recommendations = $this->plugin_recommendations( $this->group_plugin_findings( $plugin_findings ) );
 		if ( ! empty( $recommendations ) || ! empty( $this->inactive_plugins ) || ! empty( $this->inactive_themes ) ) {
-			$lines[] = 'Recommendations';
-			$lines[] = str_repeat( '-', 72 );
+			$lines[] = 'RECOMMENDATIONS';
+			$lines[] = str_repeat( '=', 80 );
 			foreach ( $recommendations as $recommendation ) {
-				$lines[] = strtoupper( $recommendation['action'] ) . '  ' . $recommendation['slug'] . ' — ' . $recommendation['reason'];
+				$lines[] = sprintf( '[%s] %s', strtoupper( $recommendation['action'] ), $recommendation['slug'] );
+				$lines[] = '  Reason: ' . $recommendation['reason'];
+				$lines[] = '';
 			}
 			if ( ! empty( $this->inactive_plugins ) ) {
-				$lines[] = 'CLEANUP  ' . count( $this->inactive_plugins ) . ' inactive plugins detected — not scanned; remove them if not needed.';
+				$count = count( $this->inactive_plugins );
+				$lines[] = '[CLEANUP] Inactive plugins';
+				$lines[] = sprintf( '  %d inactive plugin%s detected and not scanned. Remove %s if not needed.', $count, 1 === $count ? '' : 's', 1 === $count ? 'it' : 'them' );
+				$lines[] = '';
 			}
 			if ( ! empty( $this->inactive_themes ) ) {
-				$lines[] = 'CLEANUP  ' . count( $this->inactive_themes ) . ' inactive themes detected — not scanned; remove them if not needed.';
+				$count = count( $this->inactive_themes );
+				$lines[] = '[CLEANUP] Inactive themes';
+				$lines[] = sprintf( '  %d inactive theme%s detected and not scanned. Remove %s if not needed.', $count, 1 === $count ? '' : 's', 1 === $count ? 'it' : 'them' );
+				$lines[] = '';
 			}
 		}
 
 		return implode( PHP_EOL, $lines ) . PHP_EOL;
+	}
+
+	/**
+	 * Append one grouped issue to the scan log in a triage-friendly layout.
+	 */
+	private function append_scan_log_issue( array &$lines, array $issue, $number, $indent = '', $plugin = null ) {
+		$lines[] = sprintf(
+			'%s[%d] %s | %d%% confidence',
+			$indent,
+			(int) $number,
+			strtoupper( (string) $issue['severity'] ),
+			(int) $issue['confidence']
+		);
+		$lines[] = $indent . '    Problem: ' . (string) $issue['description'];
+		$lines[] = $indent . '    Locations:';
+		foreach ( $issue['findings'] as $finding ) {
+			$location = null === $plugin
+				? $this->finding_location( $finding )
+				: $this->plugin_relative_finding_location( $finding, $plugin );
+			$lines[] = $indent . '      - ' . $location;
+		}
+		$lines[] = '';
 	}
 
 	/**

@@ -19,7 +19,10 @@ $integrity->setAccessible( true );
 $integrity->setValue( $command, [
 	'bad-plugin' => [
 		'status' => 'modified', 'source' => 'wordpress.org',
-		'checksum_errors' => [ [ 'file' => 'a.php', 'message' => 'File was added' ] ],
+		'checksum_errors' => [
+		[ 'file' => 'a.php', 'message' => 'File was added' ],
+		[ 'file' => 'b.php', 'message' => 'File does not verify against checksum' ],
+	],
 	],
 ] );
 
@@ -56,5 +59,9 @@ $path = $log->invoke( $command, $report );
 if ( ! is_string( $path ) || ! is_file( $path ) ) { fwrite(STDERR,"Scan log was not written.\n"); exit(1); }
 $content = file_get_contents($path);
 if ( false === strpos($content,'uploads/a/index.php') || false === strpos($content,'uploads/b/index.php') ) { fwrite(STDERR,"Scan log must contain all paths.\n"); exit(1); }
+if ( false === strpos( $content, 'FINDINGS' ) || false === strpos( $content, 'UPLOADS (2 findings)' ) ) { fwrite(STDERR,"Scan log must use clear findings section headers.\n"); exit(1); }
+if ( false === strpos( $content, '[1] HIGH | 96% confidence' ) || false === strpos( $content, 'Locations:' ) ) { fwrite(STDERR,"Grouped scan-log issues must expose severity, confidence, and locations.\n"); exit(1); }
+if ( false !== strpos( $content, 'Rule:' ) || false !== strpos( $content, 'Occurrences:' ) || false !== strpos( $content, 'Version:' ) || false !== strpos( $content, 'Duration:' ) ) { fwrite(STDERR,"Scan log must omit version, duration, rule IDs, and occurrence labels.\n"); exit(1); }
+if ( false === strpos( $content, "Plugin integrity changes\n  File does not verify against checksum\n    - plugins/bad-plugin/b.php" ) || false === strpos( $content, "  File was added\n    - plugins/bad-plugin/a.php" ) ) { fwrite(STDERR,"Plugin integrity changes must be grouped by problem while preserving affected paths.\n"); exit(1); }
 @unlink($path); @rmdir(ABSPATH);
 echo "Grouped report smoke tests passed.\n";
