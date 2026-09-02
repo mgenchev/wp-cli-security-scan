@@ -23,6 +23,9 @@ function sanitize_key( $key ) {
 require dirname( __DIR__ ) . '/src/SecurityScanCommand.php';
 
 $command = new Security_Scan_Command();
+$plugin_dir_property = new ReflectionProperty( $command, 'plugin_dir' );
+$plugin_dir_property->setAccessible( true );
+$plugin_dir_property->setValue( $command, $root );
 $property = new ReflectionProperty( $command, 'plugin_integrity' );
 $property->setAccessible( true );
 $property->setValue(
@@ -86,6 +89,34 @@ $messages = array_column( $state['sample-plugin']['checksum_errors'], 'message' 
 if ( ! in_array( 'File differs from the official plugin checksum', $messages, true ) || ! in_array( 'Local file is not part of the official plugin package', $messages, true ) ) {
 	fwrite( STDERR, "Direct checksum verification must detect modified and added files.\n" );
 	exit( 1 );
+}
+
+if ( function_exists( 'symlink' ) ) {
+	@unlink( $plugin_dir . DIRECTORY_SEPARATOR . 'extra.php' );
+	@unlink( $plugin_dir . DIRECTORY_SEPARATOR . 'asset-link.js' );
+	if ( @symlink( $plugin_dir . DIRECTORY_SEPARATOR . 'asset.js', $plugin_dir . DIRECTORY_SEPARATOR . 'asset-link.js' ) ) {
+		$property->setValue(
+			$command,
+			[
+				'sample-plugin' => [
+					'slug' => 'sample-plugin',
+					'file' => 'sample-plugin/sample-plugin.php',
+					'status' => 'unverified',
+					'checksum_errors' => [],
+					'source' => 'unknown',
+					'repository_status' => 'unknown',
+					'reputation' => 'unverified',
+				],
+			]
+		);
+		$verify->invoke( $command, 'sample-plugin', $manifest );
+		$state = $property->getValue( $command );
+		$messages = array_column( $state['sample-plugin']['checksum_errors'], 'message' );
+		if ( 'modified' !== $state['sample-plugin']['status'] || ! in_array( 'Local plugin path is a symbolic link', $messages, true ) ) {
+			fwrite( STDERR, "Plugin checksum verification must never mark a plugin with symlinked local paths as verified.\n" );
+			exit( 1 );
+		}
+	}
 }
 
 $normalize = new ReflectionMethod( $command, 'normalize_checksum_manifest_entry' );

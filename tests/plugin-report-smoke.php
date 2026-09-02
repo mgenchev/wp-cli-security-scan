@@ -53,7 +53,7 @@ $findings = [
 	[
 		'section' => 'Plugins', 'severity' => 'medium', 'confidence' => 80,
 		'location' => 'plugins/review-plugin/inc/b.php', 'line' => 20,
-		'rule' => 'review_rule_2', 'description' => 'Second review finding',
+		'rule' => 'review_rule_2', 'description' => 'Review finding',
 	],
 	[
 		'section' => 'Plugins', 'severity' => 'critical', 'confidence' => 99,
@@ -98,8 +98,8 @@ if ( false !== strpos( $output, 'Source: Unknown' ) || false !== strpos( $output
 	exit( 1 );
 }
 
-if ( false === strpos( $output, '  2 findings' ) || false !== strpos( $output, '2 findings ·' ) ) {
-	fwrite( STDERR, "Plugin summary must show only the finding count.\n" );
+if ( 1 !== substr_count( $output, 'Review finding' ) || false === strpos( $output, 'plugins/review-plugin/inc/a.php:10' ) || false === strpos( $output, 'plugins/review-plugin/inc/b.php:20' ) ) {
+	fwrite( STDERR, "Plugin terminal findings must be grouped by problem while preserving every visible path.\n" );
 	exit( 1 );
 }
 
@@ -111,6 +111,27 @@ if ( false !== strpos( $output, 'Recommendations' ) ) {
 $groups_method = new ReflectionMethod( $command, 'group_plugin_findings' );
 $groups_method->setAccessible( true );
 $groups = $groups_method->invoke( $command, $findings );
+
+
+$recommendation_builder = new ReflectionMethod( $command, 'plugin_recommendations' );
+$recommendation_builder->setAccessible( true );
+$built_recommendations = $recommendation_builder->invoke( $command, $groups );
+$reason_by_slug = [];
+foreach ( $built_recommendations as $item ) {
+	$reason_by_slug[ $item['slug'] ] = $item['reason'];
+}
+if ( 'Multiple high-risk findings were detected.' !== ( $reason_by_slug['reinstall-plugin'] ?? null ) ) {
+	fwrite( STDERR, "Reinstall recommendation must describe the observed risk without exposing internal thresholds.\n" );
+	exit( 1 );
+}
+if ( 'Suspicious findings require manual review.' !== ( $reason_by_slug['review-plugin'] ?? null ) ) {
+	fwrite( STDERR, "Review recommendation wording is not concise or clear.\n" );
+	exit( 1 );
+}
+if ( 'Plugin files do not match the official package.' !== ( $reason_by_slug['modified-plugin'] ?? null ) ) {
+	fwrite( STDERR, "Integrity recommendation wording is not concise or clear.\n" );
+	exit( 1 );
+}
 
 $inactive_plugins = new ReflectionProperty( $command, 'inactive_plugins' );
 $inactive_plugins->setAccessible( true );
@@ -126,12 +147,12 @@ WP_CLI::$logs = [];
 $recommendations->invoke( $command, $groups );
 $recommendation_output = implode( "\n", WP_CLI::$logs );
 
-if ( false === strpos( $recommendation_output, 'HIGH PRIORITY — Suspicious findings exceeded the replacement threshold' ) || false === strpos( $recommendation_output, '  ⚠ reinstall-plugin' ) ) {
-	fwrite( STDERR, "Threshold replacement recommendation is missing or not grouped.\n" );
+if ( false === strpos( $recommendation_output, 'HIGH PRIORITY — Multiple high-risk findings detected' ) || false === strpos( $recommendation_output, '  ⚠ reinstall-plugin' ) ) {
+	fwrite( STDERR, "High-risk reinstall recommendation is missing or not grouped.\n" );
 	exit( 1 );
 }
 
-if ( false === strpos( $recommendation_output, 'HIGH PRIORITY — Plugin integrity verification failed' ) || false === strpos( $recommendation_output, '  ⚠ modified-plugin' ) ) {
+if ( false === strpos( $recommendation_output, 'HIGH PRIORITY — Plugin files do not match the official package' ) || false === strpos( $recommendation_output, '  ⚠ modified-plugin' ) ) {
 	fwrite( STDERR, "Checksum-modified plugin recommendation is missing or not grouped.\n" );
 	exit( 1 );
 }

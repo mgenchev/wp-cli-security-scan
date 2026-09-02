@@ -8,7 +8,7 @@ The package is designed for a workflow where a site's `wp-content` directory and
 
 A standard scan runs in separate stages:
 
-1. WordPress core checksum verification (`wp core verify-checksums`)
+1. Scanner-owned WordPress core checksum verification against the official WordPress.org manifest
 2. Plugin source/repository reputation
 3. WordPress.org plugin checksum verification
 4. Regular plugins in the selected scan scope (active only by default)
@@ -21,7 +21,26 @@ A standard scan runs in separate stages:
 
 The scanner is **read-only**. It does not remove, quarantine, edit, or repair files or database records.
 
-During the scan process, `WP_DEBUG`, `WP_DEBUG_DISPLAY`, and `WP_DEBUG_LOG` are forced off in memory before WordPress is loaded. The package does not edit `wp-config.php`; the change applies only to the current WP-CLI process.
+The scanner intentionally does **not** bootstrap WordPress with `wp-settings.php`. It evaluates WP-CLI's stripped `wp-config.php` code only to obtain the trusted local database/path configuration, opens its own read-only-enforcing database connection, and reads plugin/theme metadata directly from files. PHP error display is suppressed for the scan process; `wp-config.php` is not edited. The workflow therefore assumes the local WordPress core and `wp-config.php` used for analysis are trusted, while the restored `wp-content` and database are treated as suspect.
+
+## Isolated scanner runtime
+
+The restored `wp-content` directory is treated as untrusted input. The scanner therefore avoids normal `load_wordpress()` / `wp-settings.php` bootstrap and does not execute regular plugins, themes, MU plugins, or `wp-content` drop-ins in order to inspect the site.
+
+Runtime data is obtained without loading suspect application code:
+
+- WP-CLI's stripped `wp-config.php` code supplies database credentials, table prefix, and configured content paths;
+- a scanner-owned `mysqli` adapter reads WordPress tables directly instead of loading `db.php` or object-cache drop-ins, and rejects non-read SQL at the adapter boundary;
+- plugin and theme headers are parsed from file text rather than by including PHP files;
+- active plugin/theme state, users, roles, cron, and scan targets are resolved from direct database reads;
+- WordPress.org core/plugin checksum and reputation requests use scanner-owned HTTPS clients with TLS verification, an explicit WordPress.org destination allowlist, trusted `WP_PROXY_*` cURL proxy/bypass settings, `WP_HTTP_BLOCK_EXTERNAL` / `WP_ACCESSIBLE_HOSTS` policy, and a 16 MiB response-size limit.
+- WordPress core version metadata is parsed from `wp-includes/version.php` as text; the file is never included or executed by the scanner.
+
+If active plugin/theme state is malformed or cannot be trusted, the scanner fails safe to the broader installed-code scan scope instead of assuming that no code is active. Active plugin main files remain in scope even if their metadata header has been removed. Multisite `--url` resolution must match the canonical domain/path stored in the network `blogs` table; the scanner carries the resolved blog/network pair through network options, sitewide plugin activation, locale, super-admin, and uploads-path handling. It does not execute `sunrise.php` or domain-mapping code to resolve custom aliases.
+
+Because the scanner deliberately does not execute application runtime filters/drop-ins, it cannot reproduce behavior that exists only inside custom `db.php`, `sunrise.php`, plugin-registered external theme directories, or `upload_dir` filters. The restore workflow should therefore expose the suspect database through the trusted `DB_*` configuration and keep the content being investigated inside the configured scanner paths. This limitation is intentional: executing those runtime extensions would break the isolation boundary.
+
+The trusted boundary for this workflow is the clean local WordPress core, WP-CLI installation, and local `wp-config.php`. The restored `wp-content` and database remain suspect and are not trusted as executable configuration.
 
 ## Detection layers
 
@@ -111,13 +130,15 @@ wp package install https://github.com/mgenchev/wp-cli-security-scan.git
 wp security-scan
 ```
 
-The command starts before WordPress is bootstrapped. The startup indicator runs in a lightweight child process, so it keeps animating even while the main PHP process is blocked loading a very large WordPress installation:
+The command runs at `before_wp_load` and deliberately never calls the normal WordPress bootstrap. Startup work uses a lightweight child-process spinner so synchronous configuration, rule loading, and inventory preparation remain visibly active:
 
 ```text
-⠋ Security Scan — loading WordPress...
+⠋ Security Scan — initializing isolated scanner...
+⠙ Security Scan — preparing rules...
+⠹ Security Scan — preparing scan inventory...
 ```
 
-After WordPress loads, the staged flow continues with a single updating status line. Plugin reputation lookups and WordPress.org checksum-manifest downloads are performed in parallel when cURL multi is available, with a secure sequential fallback:
+The staged flow then continues with a single updating status line. Plugin reputation lookups and WordPress.org checksum-manifest downloads are performed in parallel when cURL multi is available, with a TLS-verified sequential HTTP fallback owned by the scanner:
 
 ```text
 ⠸ Scanning plugins... 1,842 files
@@ -172,24 +193,12 @@ Summary
 ----------------------------------------
 Success: Security scan completed.
 
-Recommendations
-----------------------------------------
-HIGH PRIORITY — Plugin integrity verification failed
-  ⚠ some-plugin
-  Replace these plugins with fresh trusted copies, then rescan.
-
-REVIEW — Suspicious plugin findings require manual review
-  ⚠ premium-plugin
-
-CLEANUP — Inactive code is not scanned
-  ⚠ 5 inactive plugins detected — not scanned; remove them if not needed.
-
 Detailed findings saved to /path/from/which/the/scan/was/run/security-scan.log
 ```
 
 Detailed findings are intentionally not printed in the interactive terminal report. File-content findings, affected paths and source lines are preserved in `security-scan.log`; filename-only, checksum, symlink, and database findings may not have a line number.
 
-The final terminal summary includes severity counts, files scanned, database rows scanned, administrator count, total findings, and scan duration. Recommendations remain in the console so remediation actions are immediately visible, while the detailed findings log preserves the evidence needed for manual incident review.
+The final terminal summary includes severity counts, files scanned, database rows scanned, administrator count, total findings, and scan duration. Detailed Findings and Recommendations are kept in `security-scan.log` so the console remains concise while the evidence and remediation guidance stay together for incident review.
 
 
 ## Plugin and theme scan scope
@@ -263,7 +272,7 @@ The users stage also treats recent account creation as an incident-review signal
 - for privileged accounts, 2 or more created within the same 10-minute window are enough for `CRITICAL`;
 - users in a rapid-registration cluster are shown only once at the higher `CRITICAL` severity.
 
-User findings include the user ID, login, email, role(s), and UTC registration timestamp. Burst detection is limited to the same 2-month incident window so historical imports and migrations do not dominate the report. Cron persistence scanning continues to run in the same stage.
+User findings include the user ID, login, email, role(s), and UTC registration timestamp. In the detailed scan log, repeated users/persistence findings are grouped by problem while every affected user or cron location is preserved; rapid-registration locations retain the detected cluster size. On multisite, network `site_admins` are treated as privileged for burst detection without loading WordPress user APIs. Burst detection is limited to the same 2-month incident window so historical imports and migrations do not dominate the report. Cron persistence scanning continues to run in the same stage.
 
 ## Database scanning
 
@@ -289,7 +298,7 @@ Raw contents of database dumps, source maps and compressed archives are skipped 
 
 ## Plugin reputation
 
-Before checksum verification, the scanner classifies plugin sources for the selected scan scope. It sends one read-only bulk update-check request to WordPress.org for that plugin inventory, then resolves remaining repository lookups concurrently when cURL multi is available. A secure sequential WordPress HTTP fallback is used when parallel cURL is unavailable.
+Before checksum verification, the scanner classifies plugin sources for the selected scan scope. It sends one read-only bulk update-check request to WordPress.org for that plugin inventory, then resolves remaining repository lookups concurrently when cURL multi is available. When parallel cURL is unavailable, the scanner uses its own TLS-verified sequential HTTPS fallback rather than loading the WordPress HTTP API.
 
 Reputation currently distinguishes:
 
@@ -303,54 +312,36 @@ Repository/reputation rules are independent from checksums. This means a plugin 
 
 The reputation stage is read-only and does not call `wp_update_plugins()`, so it does not write WordPress update transients.
 
-## Plugin integrity, risk scoring, and remediation
+## Plugin integrity and remediation
 
 Plugin reputation is evaluated first, then local plugin integrity is checked directly against the official WordPress.org checksum manifest for the exact plugin slug/version. The scanner no longer starts a second WP-CLI/WordPress subprocess for this stage. Checksum manifests are downloaded concurrently when possible, then local files are hashed with SHA-256 (falling back to MD5 only when required by the official manifest).
 
-Integrity remains an **internal remediation signal**. The live checklist shows only a concise completed integrity status, while detailed checksum state, numeric risk score, and raw manifest metadata remain internal rather than being exposed as standalone report fields:
+Integrity remains an **internal remediation signal**. The live checklist shows only a concise completed integrity status, while detailed checksum state and raw manifest metadata remain internal rather than being exposed as standalone report fields:
 
 - matching official checksums suppress ordinary static heuristics from that WordPress.org plugin;
 - a local mismatch causes a strong fresh-copy recommendation;
-- unavailable checksums, common for premium/custom plugins, leave static findings visible and use the weighted risk score below.
+- unavailable checksums, common for premium/custom plugins, leave static findings visible and use the internal risk assessment.
 
-For plugins without trusted checksums, the score is cumulative:
+For plugins without trusted checksums, finding severity is combined internally to choose between manual review and a fresh-copy recommendation. The decision mechanics are not exposed in reports or recommendation messages.
 
-```text
-CRITICAL = 4
-HIGH     = 3
-MEDIUM   = 2
-LOW      = 1
-```
+Human-readable finding reports group evidence by the human-readable problem type and preserve every affected path/line beneath that problem. This applies consistently to Themes, Plugins, MU plugins/drop-ins, Uploads, Other `wp-content`, Database, Core checksums, and Users/Persistence. Plugin paths keep the full `plugins/<slug>/...` prefix, while remediation remains plugin-specific so replacement/review recommendations are not lost. JSON output remains raw per-finding evidence rather than grouped presentation data.
 
-A score from `0–9` results in manual-review guidance. A score of `10+` results in a strong fresh-copy recommendation. The numeric score remains internal-only.
+All remediation guidance is collected once in the **Recommendations** block in the detailed report, including fresh-copy actions, manual-review actions, and inactive plugin/theme cleanup notices. Internal decision criteria are not exposed in recommendation messages.
 
-Human-readable reports group findings by plugin and then by issue type. Paths always keep the full `plugins/<slug>/...` prefix. Plugins below the replacement threshold show every grouped affected path. Plugins that already require replacement are collapsed so a long list of findings does not hide the remediation action.
-
-All remediation guidance is collected once in the **final Recommendations block at the end of the complete report**, including fresh-copy actions, manual-review actions, and inactive plugin/theme cleanup notices.
-
-Example for a plugin that remains below the replacement threshold:
+Recommendation messages stay short and describe the observed condition rather than the internal scoring rule used to select an action. Examples:
 
 ```text
-premium-plugin
-  3 findings
+[REINSTALL] modified-plugin
+  Reason: Plugin files do not match the official package.
 
-  HIGH · 91%      Request-controlled dynamic callback
-                   plugins/premium-plugin/includes/b.php:88
-  MEDIUM · 72%    Suspicious encoded execution context
-                   plugins/premium-plugin/includes/c.php:41
-  LOW · 55%       Low-confidence suspicious construct
-                   plugins/premium-plugin/includes/d.php:19
-```
+[REINSTALL] suspicious-plugin
+  Reason: Multiple high-risk findings were detected.
 
-When a plugin reaches the replacement threshold, its long per-file list is omitted from the terminal and the final report ends with:
+[REVIEW] premium-plugin
+  Reason: Suspicious findings require manual review.
 
-```text
-Recommendations
---------------------------------------------------
-⚠ suspicious-premium-plugin
-  Replace the entire plugin with a fresh trusted copy, then rescan.
-
-⚠ 6 inactive plugins detected — not scanned; remove them if not needed.
+[REVIEW] verified-plugin
+  Reason: High-confidence findings remain despite verified files.
 ```
 
 
@@ -406,7 +397,7 @@ Spinner/progress output is disabled for export modes, so JSON stdout remains mac
 
 ## Core checksum scope
 
-Core integrity uses `wp core verify-checksums` without `--include-root`. This verifies WordPress core files but does not treat unrelated files/directories in the WordPress root (for example `.drone-backups`) as security threats. The custom malware scan remains scoped to `wp-content` and the database.
+Core integrity is scanner-owned. The scanner reads the installed version/locale from `wp-includes/version.php` as text, downloads the official MD5 manifest from `api.wordpress.org`, and compares the local core files directly. It preserves the previous WP-CLI default root scope: `wp-admin`, `wp-includes`, and root `wp-*` files are checked for unexpected files, while arbitrary unrelated root files/directories are not treated as core-integrity findings. `wp-content` entries from the core manifest are intentionally excluded because `wp-content` is handled by the package's dedicated malware/integrity stages. Remote manifest paths are validated as safe relative paths before any filesystem access.
 
 ## Optional checksum flags
 
@@ -458,4 +449,4 @@ Legitimate variable-variable assignments such as `$$key = $value` are not report
 
 ### Automatic scan log
 
-Every completed scan overwrites `security-scan.log` in the directory from which the scan was launched. The log is intended for manual incident review and uses separate Summary, Findings, and Recommendations blocks. Findings use a compact numbered layout showing severity, confidence, the problem, and every affected path/line. Repeated Uploads/plugin issues remain grouped where the existing grouping preserves the full evidence. Core checksum findings are grouped by checksum problem while retaining every affected core path. Plugin checksum/integrity changes are grouped by problem while preserving every affected plugin path. `Local file is not part of the official plugin package` means the local file exists inside the plugin directory but is absent from the official WordPress.org checksum manifest for that exact slug/version; it is an integrity mismatch, not by itself proof of malware. Interactive scans print the log path after the final Recommendations block so the detailed evidence is easy to locate.
+Every completed scan overwrites `security-scan.log` in the directory from which the scan was launched. The log is intended for manual incident review and uses separate Summary, Findings, and Recommendations blocks. Findings use a compact numbered layout showing severity, confidence, the problem, and every affected path/line. All human-readable finding sections are grouped consistently by problem type, including Themes, Plugins, MU plugins/drop-ins, Uploads, Other `wp-content`, Database, Core checksums, and Users/Persistence. Plugin checksum/integrity changes are also grouped by problem while preserving every affected plugin path. `Local file is not part of the official plugin package` means the local file exists inside the plugin directory but is absent from the official WordPress.org checksum manifest for that exact slug/version; it is an integrity mismatch, not by itself proof of malware. Symlinked plugin roots/paths are treated as modified integrity rather than eligible for verified-plugin suppression. Interactive scans keep the console concise with the Summary only, then print the scan-log path; detailed Findings and Recommendations remain in `security-scan.log`.

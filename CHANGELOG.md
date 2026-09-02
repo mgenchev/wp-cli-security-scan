@@ -1,5 +1,49 @@
 # Changelog
 
+## [1.0.0] - 2026-09-02
+
+### Changed
+
+- Replaced normal WordPress `load_wordpress()` bootstrap with an isolated scanner runtime that stops after evaluating WP-CLI's stripped local `wp-config.php` configuration.
+- Added a scanner-owned direct `mysqli` adapter so database, option, user, role, cron, and persistence checks no longer require `wpdb`, `db.php`, object-cache, or other `wp-content` runtime code.
+- Plugin/theme metadata and active-code inventory are now read from filesystem text and direct database values without executing plugin/theme PHP.
+- WordPress.org reputation and checksum requests now use scanner-owned TLS-verified HTTP clients instead of the WordPress HTTP API fallback.
+- Added fail-safe scan-scope handling: malformed plugin/theme activation state expands to installed-code scanning rather than risking an active-only false negative.
+- Active plugin files remain in static scan scope even when their `Plugin Name` header has been removed.
+- Multisite `--url` resolution now refuses an unresolved canonical site instead of silently scanning the wrong blog prefix.
+- Added support for additional WordPress-compatible `DB_HOST` forms and `BLOGUPLOADDIR` in the isolated runtime.
+- Reworked the users/persistence stage to process users and capability metadata in bounded batches of 100 instead of loading the complete account/capability dataset into memory.
+- Added an explicit users/persistence error boundary so isolated DB failures are reported instead of ending the scan silently.
+- Added bounded serialized-value recursion depth, raw cron IOC fallback when safe decoding is not possible, and support for trusted `CUSTOM_USER_TABLE` / `CUSTOM_USER_META_TABLE` configuration.
+- Enforced the scanner database adapter's read-only contract by rejecting non-read SQL, statement separators, and `SELECT ... INTO OUTFILE/DUMPFILE` server-file writes.
+- Restricted scanner-owned outbound HTTP to TLS-verified official WordPress.org API/checksum hosts and added trusted `WP_PROXY_*` cURL proxy/bypass compatibility without loading WordPress HTTP classes.
+- Kept the startup spinner animated during synchronous rule loading and separated rule preparation from plugin/theme inventory preparation.
+- Grouped `Users & persistence` log findings by human-readable problem while preserving each affected user/cron location; rapid-registration cluster size remains attached to each user location.
+- Added isolated-runtime parity for trusted `WP_HOME` / `WP_SITEURL` host overrides and multisite `site_admins` so network super administrators participate in privileged-user burst detection without loading `WP_User`.
+- Replaced the nested `wp core verify-checksums` subprocess with scanner-owned core integrity verification: core version metadata is parsed as text, the official WordPress.org checksum manifest is fetched through the isolated HTTP client, and local files are hashed directly without launching a second WP-CLI process.
+- Added strict validation for remote core checksum manifest paths before filesystem access, explicit findings for missing core files and core symlinks, and preserved WP-CLI's default unexpected-core-file scope.
+- Completed isolated multisite parity by resolving the selected blog's actual network ID, network main site, primary network, network-level plugin activation, locale fallback, and multisite uploads base directory without loading WordPress network objects.
+- Matched WordPress multisite detection semantics for legacy `SUBDOMAIN_INSTALL` / `VHOST` / `SUNRISE` configurations while continuing to refuse execution of `sunrise.php`.
+- Hardened plugin source classification so an explicit non-WordPress.org `Update URI` remains external even if the same slug appears in the WordPress.org update response.
+- Hardened plugin integrity against symlink trust: symlinked plugin roots/paths now force `modified` integrity instead of being eligible for `verified` suppression.
+- Extended symlink coverage to MU plugins, drop-ins, and other `wp-content` paths instead of silently skipping those links.
+- Added `WP_HTTP_BLOCK_EXTERNAL` / `WP_ACCESSIBLE_HOSTS` compatibility to scanner-owned HTTP and capped JSON responses at 16 MiB across cURL, cURL-multi, and stream transports.
+- Optimized scanner-owned cURL transport by restoring native `CURLOPT_RETURNTRANSFER` buffering and enforcing the 16 MiB response guard through lightweight transfer-progress callbacks plus a final body-size check instead of processing every response chunk in PHP.
+- Cached SHA-256 availability for plugin integrity so the runtime hash capability is resolved once rather than re-checking `hash_algos()` for every plugin file.
+- Unified all human-readable finding reports around problem-type grouping: Themes, Plugins, MU/drop-ins, Uploads, Other `wp-content`, Database, Core, and Users/Persistence now render each problem once with every affected location preserved; JSON remains raw per-finding evidence.
+- Removed the final Recommendations block from the interactive console; recommendations remain fully preserved in `security-scan.log` and detailed exports, while the console now ends with Summary, completion status, and the log path.
+- Simplified user-facing remediation reasons so Recommendations describe the observed risk or integrity problem without exposing internal score/threshold criteria.
+
+### Tests
+
+- Added isolated-runtime regression coverage proving plugin metadata parsing does not execute plugin code, serialized database objects are not instantiated, WordPress runtime APIs are absent, and common DB host formats remain supported.
+- Added isolated-runtime regression coverage for read-only SQL enforcement, outbound HTTP destination allowlisting, and `WP_PROXY_*` proxy/bypass handling.
+- Added regression coverage for animated rule preparation, grouped users/persistence log findings, trusted home URL overrides, and multisite super-administrator privilege resolution.
+- Added scanner-owned core checksum regression coverage for non-executing version metadata parsing, safe manifest-path validation, default unexpected-file scope, and removal of nested `WP_CLI::runcommand()` checksum execution.
+- Expanded active/full-scope regression coverage with malformed activation data, unsafe theme paths, and active plugins with removed metadata headers.
+- Replaced the obsolete pre-manifest plugin-checksum parser smoke test with current direct-checksum/source-classification coverage, so the complete test suite no longer contains a known stale failure.
+- Added isolated parity coverage for multi-network context, locale/uploads resolution, HTTP host policy, bounded HTTP responses, and symlink coverage across plugin integrity/MU/drop-in/other-content stages.
+
 ## [0.3.11] - 2026-09-02
 
 ### Added

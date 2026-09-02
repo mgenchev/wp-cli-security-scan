@@ -104,4 +104,21 @@ if ( 4 !== $path_count ) {
 	exit( 1 );
 }
 
+
+$sha_property = new ReflectionProperty( $command, 'plugin_sha256_available' );
+$sha_property->setAccessible( true );
+if ( null !== $sha_property->getValue( $command ) ) {
+	fwrite( STDERR, "Plugin SHA-256 availability should be lazy before integrity verification.\n" );
+	exit( 1 );
+}
+$sha_method = new ReflectionMethod( $command, 'plugin_sha256_is_available' );
+$sha_method->setAccessible( true );
+$sha_first = $sha_method->invoke( $command );
+$sha_cached = $sha_property->getValue( $command );
+$sha_second = $sha_method->invoke( $command );
+if ( ! is_bool( $sha_first ) || $sha_first !== $sha_cached || $sha_first !== $sha_second ) {
+	fwrite( STDERR, "Plugin integrity should cache SHA-256 availability instead of recalculating it for every file.\n" );
+	exit( 1 );
+}
+
 echo "Plugin integrity smoke tests passed.\n";

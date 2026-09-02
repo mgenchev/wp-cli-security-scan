@@ -24,6 +24,7 @@
     "autoload": {
         "files": [
             "src/PhpDataFlowAnalyzer.php",
+            "src/ScannerDatabase.php",
             "src/SecurityScanCommand.php"
         ]
     }

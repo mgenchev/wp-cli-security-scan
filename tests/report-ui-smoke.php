@@ -17,6 +17,16 @@ class WP_CLI {
 require dirname( __DIR__ ) . '/src/SecurityScanCommand.php';
 
 $command = new Security_Scan_Command();
+
+$version = new ReflectionMethod( $command, 'version' );
+$version->setAccessible( true );
+WP_CLI::$logs = [];
+$version->invoke( $command );
+if ( false === strpos( implode( "\n", WP_CLI::$logs ), 'WP-CLI Security Scan 1.0.0' ) ) {
+	fwrite( STDERR, "Version command must report 1.0.0.\n" );
+	exit( 1 );
+}
+
 $interactive = new ReflectionProperty( $command, 'interactive' );
 $interactive->setAccessible( true );
 $interactive->setValue( $command, true );
@@ -96,8 +106,13 @@ if ( false !== strpos( $output, 'Findings' ) || false !== strpos( $output, 'Uplo
 	exit( 1 );
 }
 
-if ( false === strpos( $output, 'Summary' ) || false === strpos( $output, 'Recommendations' ) ) {
-	fwrite( STDERR, "Summary and Recommendations must remain in the terminal report.\n" );
+if ( false === strpos( $output, 'Summary' ) ) {
+	fwrite( STDERR, "Summary must remain in the terminal report.\n" );
+	exit( 1 );
+}
+
+if ( false !== strpos( $output, 'Recommendations' ) || false !== strpos( $output, '[REINSTALL]' ) || false !== strpos( $output, '[REVIEW]' ) || false !== strpos( $output, '[CLEANUP]' ) ) {
+	fwrite( STDERR, "Recommendations must not be printed in the terminal report.\n" );
 	exit( 1 );
 }
 
