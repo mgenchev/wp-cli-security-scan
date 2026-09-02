@@ -23,8 +23,8 @@ $integrity->setValue( $command, [
 	'bad-plugin' => [
 		'status' => 'modified', 'source' => 'wordpress.org',
 		'checksum_errors' => [
-		[ 'file' => 'a.php', 'message' => 'File was added' ],
-		[ 'file' => 'b.php', 'message' => 'File does not verify against checksum' ],
+		[ 'file' => 'a.php', 'message' => 'Local file is not part of the official plugin package' ],
+		[ 'file' => 'b.php', 'message' => 'File differs from the official plugin checksum' ],
 	],
 	],
 ] );
@@ -51,9 +51,9 @@ if ( false === strpos( implode("\n", WP_CLI::$logs), 'bad-plugin' ) ) {
 }
 
 $core = [
-	[ 'section'=>'Core checksums','severity'=>'high','confidence'=>96,'description'=>"File doesn't verify against checksum",'location'=>'wp-includes/a.php','line'=>null,'rule'=>'core_checksum_mismatch' ],
-	[ 'section'=>'Core checksums','severity'=>'high','confidence'=>96,'description'=>"File doesn't verify against checksum",'location'=>'wp-includes/b.php','line'=>null,'rule'=>'core_checksum_mismatch' ],
-	[ 'section'=>'Core checksums','severity'=>'high','confidence'=>96,'description'=>'File should not exist','location'=>'wp-admin/extra.php','line'=>null,'rule'=>'core_checksum_mismatch' ],
+	[ 'section'=>'Core checksums','severity'=>'high','confidence'=>96,'description'=>'Core file differs from the official WordPress checksum','location'=>'wp-includes/a.php','line'=>null,'rule'=>'core_checksum_mismatch' ],
+	[ 'section'=>'Core checksums','severity'=>'high','confidence'=>96,'description'=>'Core file differs from the official WordPress checksum','location'=>'wp-includes/b.php','line'=>null,'rule'=>'core_checksum_mismatch' ],
+	[ 'section'=>'Core checksums','severity'=>'high','confidence'=>96,'description'=>'Unexpected file found in WordPress core','location'=>'wp-admin/extra.php','line'=>null,'rule'=>'core_checksum_mismatch' ],
 ];
 $report = [
 	'scanned_at'=>gmdate('c'),'duration_seconds'=>1.2,
@@ -71,9 +71,9 @@ if ( false === strpos($content,'uploads/a/index.php') || false === strpos($conte
 if ( false === strpos( $content, 'FINDINGS' ) || false === strpos( $content, 'UPLOADS (2 findings)' ) ) { fwrite(STDERR,"Scan log must use clear findings section headers.\n"); exit(1); }
 if ( false === strpos( $content, '[1] HIGH | 96% confidence' ) || false === strpos( $content, 'Locations:' ) ) { fwrite(STDERR,"Grouped scan-log issues must expose severity, confidence, and locations.\n"); exit(1); }
 if ( false !== strpos( $content, 'Rule:' ) || false !== strpos( $content, 'Occurrences:' ) || false !== strpos( $content, 'Version:' ) || false !== strpos( $content, 'Duration:' ) ) { fwrite(STDERR,"Scan log must omit version, duration, rule IDs, and occurrence labels.\n"); exit(1); }
-if ( false === strpos( $content, "Plugin integrity changes\n  File does not verify against checksum\n    - plugins/bad-plugin/b.php" ) || false === strpos( $content, "  File was added\n    - plugins/bad-plugin/a.php" ) ) { fwrite(STDERR,"Plugin integrity changes must be grouped by problem while preserving affected paths.\n"); exit(1); }
+if ( false === strpos( $content, "Plugin integrity changes\n  File differs from the official plugin checksum\n    - plugins/bad-plugin/b.php" ) || false === strpos( $content, "  Local file is not part of the official plugin package\n    - plugins/bad-plugin/a.php" ) ) { fwrite(STDERR,"Plugin integrity changes must be grouped by problem while preserving affected paths.\n"); exit(1); }
 
-if ( 1 !== substr_count( $content, "Problem: File doesn't verify against checksum" ) || false === strpos( $content, 'wp-includes/a.php' ) || false === strpos( $content, 'wp-includes/b.php' ) || false === strpos( $content, 'Problem: File should not exist' ) || false === strpos( $content, 'wp-admin/extra.php' ) ) { fwrite(STDERR,"Core checksum findings must be grouped by problem while preserving all affected paths.\n"); exit(1); }
+if ( 1 !== substr_count( $content, "Problem: Core file differs from the official WordPress checksum" ) || false === strpos( $content, 'wp-includes/a.php' ) || false === strpos( $content, 'wp-includes/b.php' ) || false === strpos( $content, 'Problem: Unexpected file found in WordPress core' ) || false === strpos( $content, 'wp-admin/extra.php' ) ) { fwrite(STDERR,"Core checksum findings must be grouped by problem while preserving all affected paths.\n"); exit(1); }
 if ( false === strpos( $content, "\n\nSUMMARY\n" ) || false === strpos( $content, "\n\nFINDINGS\n" ) ) { fwrite(STDERR,"Main scan-log sections must use consistent extra spacing.\n"); exit(1); }
 if ( false !== strpos( $content, '═' ) || false !== strpos( $content, '─' ) ) { fwrite(STDERR,"Scan log separators must use portable ASCII hyphens.\n"); exit(1); }
 @unlink($path); @rmdir(ABSPATH);

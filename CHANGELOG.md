@@ -1,5 +1,27 @@
 # Changelog
 
+## [0.3.11] - 2026-09-02
+
+### Added
+
+- Added opt-in `--full-scan` mode for the main scan and focused plugin/theme commands.
+- Full-scan mode includes inactive regular plugins in reputation, WordPress.org checksum-integrity, and static malware scans.
+- Full-scan mode includes inactive themes in static malware scans while leaving theme checksum/integrity verification intentionally out of scope.
+
+### Changed
+
+- Startup scope messages now state whether the scan covers active-only code or all installed regular plugins/themes.
+- Inactive-code cleanup recommendations now distinguish between code that was not scanned in default mode and code that was included by `--full-scan`.
+
+## [0.3.10] - 2026-09-02
+
+### Changed
+
+- Reworded plugin and core checksum findings so integrity problems are explicit without requiring internal rule IDs.
+- `File was added` is now reported as `Local file is not part of the official plugin package`; checksum mismatches now state whether the local plugin/core file differs from the official checksum.
+- Exact IOC descriptions now identify the matched malware family, web shell, domain, option, or trigger so human-readable logs remain self-contained after rule IDs were removed.
+- Clarified several filename, PHP configuration, `.htaccess`, and plugin repository findings without changing their detection logic, severity, or confidence.
+
 ## [0.3.9] - 2026-09-02
 
 ### Changed

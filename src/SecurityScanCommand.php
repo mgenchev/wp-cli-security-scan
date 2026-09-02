@@ -10,7 +10,7 @@ if ( ! defined( 'WP_CLI' ) || ! WP_CLI ) {
 }
 
 class Security_Scan_Command {
-	private const VERSION = '0.3.9';
+	private const VERSION = '0.3.11';
 	private const DB_BATCH_SIZE = 500;
 	private const FILE_CHUNK_SIZE = 524288;
 	private const FILE_CHUNK_OVERLAP = 8192;
@@ -82,10 +82,11 @@ class Security_Scan_Command {
 	private $admin_count = 0;
 	private $modification_clusters = [];
 	private $include_node_modules = false;
+	private $full_scan = false;
 	private $background_spinner_process = null;
 	private $php_data_flow_analyzer = null;
 	private $plugin_integrity = [];
-	private $active_plugin_files = [];
+	private $plugin_scan_files = [];
 	private $inactive_plugins = [];
 	private $active_theme_slugs = [];
 	private $inactive_themes = [];
@@ -132,11 +133,15 @@ class Security_Scan_Command {
 	 * [--include-node-modules]
 	 * : Include node_modules directories in file scans. They are skipped by default.
 	 *
+	 * [--full-scan]
+	 * : Include inactive regular plugins in reputation/checksum/static scans and inactive themes in static scans.
+	 *
 	 * ## EXAMPLES
 	 *
 	 *     wp security-scan
 	 *     wp security-scan --format=markdown --output=security-report.md
 	 *     wp security-scan --format=json
+	 *     wp security-scan --full-scan
 	 *
 	 * @when before_wp_load
 	 */
@@ -160,6 +165,11 @@ class Security_Scan_Command {
 	/**
 	 * Scan plugins and plugin integrity only.
 	 *
+	 * ## OPTIONS
+	 *
+	 * [--full-scan]
+	 * : Include inactive regular plugins in reputation, checksum, and static scans.
+	 *
 	 * @when before_wp_load
 	 */
 	public function plugins( $args, $assoc_args ) {
@@ -168,6 +178,11 @@ class Security_Scan_Command {
 
 	/**
 	 * Scan themes only.
+	 *
+	 * ## OPTIONS
+	 *
+	 * [--full-scan]
+	 * : Include inactive themes in the static scan.
 	 *
 	 * @when before_wp_load
 	 */
@@ -221,6 +236,7 @@ class Security_Scan_Command {
 		$this->reset_state();
 		$this->configure_output( $assoc_args );
 		$this->include_node_modules = isset( $assoc_args['include-node-modules'] );
+		$this->full_scan = isset( $assoc_args['full-scan'] );
 		$this->suppress_wordpress_debug();
 		$this->start_time = microtime( true );
 		$this->launch_directory = $this->resolve_launch_directory();
@@ -252,7 +268,7 @@ class Security_Scan_Command {
 			\WP_CLI::log( '' );
 			\WP_CLI::log( 'Security Scan' );
 			\WP_CLI::log( str_repeat( '-', 50 ) );
-			$this->render_active_scope_notices( $sections );
+			$this->render_scan_scope_notices( $sections );
 		}
 
 		foreach ( $sections as $section ) {
@@ -276,7 +292,7 @@ class Security_Scan_Command {
 					break;
 
 				case 'plugins':
-					$this->scan_active_plugins();
+					$this->scan_regular_plugins();
 					break;
 
 				case 'mu_plugins':
@@ -284,7 +300,7 @@ class Security_Scan_Command {
 					break;
 
 				case 'themes':
-					$this->scan_active_themes();
+					$this->scan_themes();
 					break;
 
 				case 'uploads':
@@ -324,9 +340,10 @@ class Security_Scan_Command {
 		$this->admin_count = 0;
 		$this->modification_clusters = [];
 		$this->include_node_modules = false;
+		$this->full_scan = false;
 		$this->php_data_flow_analyzer = null;
 		$this->plugin_integrity = [];
-		$this->active_plugin_files = [];
+		$this->plugin_scan_files = [];
 		$this->inactive_plugins = [];
 		$this->active_theme_slugs = [];
 		$this->inactive_themes = [];
@@ -557,7 +574,11 @@ class Security_Scan_Command {
 					$line = $this->strip_wp_cli_prefix( trim( $line ) );
 					if ( preg_match( "~^(File doesn\\'t verify against checksum|File should not exist):\\s*(.+)$~i", $line, $matches ) ) {
 						$matched = true;
-						$this->add_finding( $stage, 'high', 96, $matches[2], 'core_checksum_mismatch', $matches[1] );
+						$description = 0 === strcasecmp( $matches[1], "File doesn't verify against checksum" )
+							? 'Core file differs from the official WordPress checksum'
+							: 'Unexpected file found in WordPress core';
+
+						$this->add_finding( $stage, 'high', 96, $matches[2], 'core_checksum_mismatch', $description );
 					}
 				}
 
@@ -651,7 +672,7 @@ class Security_Scan_Command {
 			$this->set_plugin_integrity_status( $slug, 'modified' );
 			$this->plugin_integrity[ $slug ]['checksum_errors'][] = [
 				'file'    => $main_file,
-				'message' => 'Plugin directory is missing',
+				'message' => 'Plugin directory referenced by the active plugin list could not be found',
 			];
 			return;
 		}
@@ -690,7 +711,7 @@ class Security_Scan_Command {
 			}
 
 			if ( ! array_key_exists( $relative, $normalized_manifest ) ) {
-				$errors[] = [ 'file' => $relative, 'message' => 'File was added' ];
+				$errors[] = [ 'file' => $relative, 'message' => 'Local file is not part of the official plugin package' ];
 				continue;
 			}
 
@@ -706,7 +727,7 @@ class Security_Scan_Command {
 			}
 
 			if ( ! $verified ) {
-				$errors[] = [ 'file' => $relative, 'message' => 'File does not verify against checksum' ];
+				$errors[] = [ 'file' => $relative, 'message' => 'File differs from the official plugin checksum' ];
 			}
 		}
 
@@ -782,16 +803,20 @@ class Security_Scan_Command {
 				continue;
 			}
 
-			if ( ! is_plugin_active( $file ) ) {
+			$is_active = is_plugin_active( $file );
+			if ( ! $is_active ) {
 				$this->inactive_plugins[] = [
 					'slug' => $slug,
 					'name' => isset( $data['Name'] ) ? (string) $data['Name'] : $slug,
 					'file' => $file,
 				];
-				continue;
+
+				if ( ! $this->full_scan ) {
+					continue;
+				}
 			}
 
-			$this->active_plugin_files[ $file ] = true;
+			$this->plugin_scan_files[ $file ] = true;
 			$this->plugin_integrity[ $slug ] = [
 				'slug'              => $slug,
 				'name'              => isset( $data['Name'] ) ? (string) $data['Name'] : $slug,
@@ -928,7 +953,7 @@ class Security_Scan_Command {
 		}
 
 		$plugins = get_plugins();
-		return array_intersect_key( $plugins, $this->active_plugin_files );
+		return array_intersect_key( $plugins, $this->plugin_scan_files );
 	}
 
 	/**
@@ -1096,7 +1121,7 @@ class Security_Scan_Command {
 					94,
 					'plugins/' . $slug,
 					'plugin_reputation_repository_' . $status,
-					'Plugin is ' . $status . ' on WordPress.org and requires security review'
+					'Plugin is ' . $status . ' on WordPress.org; verify the repository status and plugin source'
 				);
 				continue;
 			}
@@ -1458,18 +1483,22 @@ class Security_Scan_Command {
 	}
 
 	/**
-	 * Print the active-only plugin/theme scan scope.
+	 * Print the plugin/theme scan scope selected for this run.
 	 */
-	private function render_active_scope_notices( array $sections ) {
+	private function render_scan_scope_notices( array $sections ) {
 		$show_plugins = (bool) array_intersect( [ 'plugin_reputation', 'plugin_checksums', 'plugins' ], $sections );
 		$show_themes = in_array( 'themes', $sections, true );
 
 		if ( $show_plugins ) {
-			\WP_CLI::log( 'Plugin scope: active plugins only.' );
+			\WP_CLI::log( $this->full_scan
+				? 'Plugin scope: all installed regular plugins.'
+				: 'Plugin scope: active plugins only.' );
 		}
 
 		if ( $show_themes ) {
-			\WP_CLI::log( 'Theme scope: active theme and parent theme only, when applicable.' );
+			\WP_CLI::log( $this->full_scan
+				? 'Theme scope: all installed themes.'
+				: 'Theme scope: active theme and parent theme only, when applicable.' );
 		}
 
 		if ( $show_plugins || $show_themes ) {
@@ -1478,9 +1507,9 @@ class Security_Scan_Command {
 	}
 
 	/**
-	 * Scan active regular plugins only.
+	 * Scan regular plugins selected by the current scan scope.
 	 */
-	private function scan_active_plugins() {
+	private function scan_regular_plugins() {
 		$stage = 'Plugins';
 		$this->stage_start( $stage );
 		$count = 0;
@@ -1533,14 +1562,32 @@ class Security_Scan_Command {
 	}
 
 	/**
-	 * Scan the active theme and its parent theme only.
+	 * Return theme slugs selected by the current scan scope.
 	 */
-	private function scan_active_themes() {
+	private function theme_slugs_for_scan() {
+		$slugs = array_keys( $this->active_theme_slugs );
+
+		if ( $this->full_scan ) {
+			foreach ( $this->inactive_themes as $theme ) {
+				$slug = (string) ( $theme['slug'] ?? '' );
+				if ( '' !== $slug ) {
+					$slugs[] = $slug;
+				}
+			}
+		}
+
+		return array_values( array_unique( $slugs ) );
+	}
+
+	/**
+	 * Scan themes selected by the current scan scope.
+	 */
+	private function scan_themes() {
 		$stage = 'Themes';
 		$this->stage_start( $stage );
 		$count = 0;
 
-		foreach ( array_keys( $this->active_theme_slugs ) as $slug ) {
+		foreach ( $this->theme_slugs_for_scan() as $slug ) {
 			$theme = wp_get_theme( $slug );
 			if ( ! $theme || ! $theme->exists() ) {
 				continue;
@@ -1786,9 +1833,9 @@ class Security_Scan_Command {
 		$lower_filename = strtolower( $filename );
 
 		$known_malicious_filenames = [
-			'wp-antymalwary-bot.php' => 'Known malicious fake WordPress plugin filename',
-			'wp-apx-upx.php'        => 'Known malicious compact WordPress file-uploader filename',
-			'wp-apxupx.php'         => 'Known malicious compact WordPress file-uploader filename',
+			'wp-antymalwary-bot.php' => 'Filename matches a known malicious fake WordPress plugin',
+			'wp-apx-upx.php'        => 'Filename matches a known malicious WordPress file-uploader',
+			'wp-apxupx.php'         => 'Filename matches a known malicious WordPress file-uploader',
 		];
 
 		if ( isset( $known_malicious_filenames[ $lower_filename ] ) ) {
@@ -1800,11 +1847,11 @@ class Security_Scan_Command {
 		}
 
 		if ( preg_match( '~\.(?:jpe?g|png|gif|webp|svg|ico|pdf|zip)\.(?:php\d*|phtml|phar)$~i', $filename ) ) {
-			$this->add_file_finding_once( $seen, $stage, 'critical', 99, $relative, 'double_extension', 'Suspicious media/document + executable double extension' );
+			$this->add_file_finding_once( $seen, $stage, 'critical', 99, $relative, 'double_extension', 'File uses a media/document extension followed by an executable PHP extension' );
 		}
 
 		if ( preg_match( '~\.php\.(?:bak|old|orig|save|txt|disabled)$~i', $filename ) ) {
-			$this->add_file_finding_once( $seen, $stage, 'medium', 70, $relative, 'php_backup_file', 'Backup copy of a PHP file requires review' );
+			$this->add_file_finding_once( $seen, $stage, 'medium', 70, $relative, 'php_backup_file', 'Backup copy of an executable PHP file requires review' );
 		}
 
 		if ( in_array( strtolower( $filename ), [ '.user.ini', 'php.ini' ], true ) ) {
@@ -1812,7 +1859,7 @@ class Security_Scan_Command {
 			$matches = [];
 			if ( is_string( $content ) && 1 === preg_match( '~auto_(?:prepend|append)_file\s*=~i', $content, $matches, PREG_OFFSET_CAPTURE ) ) {
 				$line = $this->line_from_buffer_offset( $content, 1, $matches[0][1] );
-				$this->add_file_finding_once( $seen, $stage, 'critical', 98, $relative, 'php_auto_prepend', 'PHP auto_prepend/auto_append persistence directive found', $line );
+				$this->add_file_finding_once( $seen, $stage, 'critical', 98, $relative, 'php_auto_prepend', 'PHP configuration enables auto_prepend_file/auto_append_file persistence', $line );
 			}
 		}
 
@@ -1821,7 +1868,7 @@ class Security_Scan_Command {
 			$matches = [];
 			if ( is_string( $content ) && 1 === preg_match( '~(?:AddType|AddHandler|SetHandler)[^\r\n]*(?:php|x-httpd-php)~i', $content, $matches, PREG_OFFSET_CAPTURE ) ) {
 				$line = $this->line_from_buffer_offset( $content, 1, $matches[0][1] );
-				$this->add_file_finding_once( $seen, $stage, 'critical', 98, $relative, 'htaccess_php_handler', 'htaccess enables PHP execution for additional file types', $line );
+				$this->add_file_finding_once( $seen, $stage, 'critical', 98, $relative, 'htaccess_php_handler', '.htaccess enables PHP execution for additional file types', $line );
 			}
 		}
 	}
@@ -3667,14 +3714,20 @@ PHP;
 		}
 
 		if ( $has_inactive_plugins || $has_inactive_themes ) {
-			\WP_CLI::log( 'CLEANUP — Inactive code is not scanned' );
+			\WP_CLI::log( $this->full_scan ? 'CLEANUP — Inactive code' : 'CLEANUP — Inactive code is not scanned' );
 			if ( $has_inactive_plugins ) {
 				$count = count( $this->inactive_plugins );
-				\WP_CLI::log( sprintf( '  ⚠ %d inactive plugin%s detected — not scanned; remove %s if not needed.', $count, 1 === $count ? '' : 's', 1 === $count ? 'it' : 'them' ) );
+				$message = $this->full_scan
+					? '  ⚠ %d inactive plugin%s detected — included in full scan; remove %s if not needed.'
+					: '  ⚠ %d inactive plugin%s detected — not scanned; remove %s if not needed.';
+				\WP_CLI::log( sprintf( $message, $count, 1 === $count ? '' : 's', 1 === $count ? 'it' : 'them' ) );
 			}
 			if ( $has_inactive_themes ) {
 				$count = count( $this->inactive_themes );
-				\WP_CLI::log( sprintf( '  ⚠ %d inactive theme%s detected — not scanned; remove %s if not needed.', $count, 1 === $count ? '' : 's', 1 === $count ? 'it' : 'them' ) );
+				$message = $this->full_scan
+					? '  ⚠ %d inactive theme%s detected — included in full scan; remove %s if not needed.'
+					: '  ⚠ %d inactive theme%s detected — not scanned; remove %s if not needed.';
+				\WP_CLI::log( sprintf( $message, $count, 1 === $count ? '' : 's', 1 === $count ? 'it' : 'them' ) );
 			}
 		}
 	}
@@ -3731,15 +3784,15 @@ PHP;
 			$lines[] = '';
 		}
 		if ( $has_inactive_plugins || $has_inactive_themes ) {
-			$lines[] = '### Cleanup — Inactive code is not scanned';
+			$lines[] = $this->full_scan ? '### Cleanup — Inactive code' : '### Cleanup — Inactive code is not scanned';
 			$lines[] = '';
 			if ( $has_inactive_plugins ) {
 				$count = count( $this->inactive_plugins );
-				$lines[] = '- ⚠ ' . $count . ' inactive plugin' . ( 1 === $count ? '' : 's' ) . ' detected — not scanned; remove ' . ( 1 === $count ? 'it' : 'them' ) . ' if not needed.';
+				$lines[] = '- ⚠ ' . $count . ' inactive plugin' . ( 1 === $count ? '' : 's' ) . ' detected — ' . ( $this->full_scan ? 'included in full scan' : 'not scanned' ) . '; remove ' . ( 1 === $count ? 'it' : 'them' ) . ' if not needed.';
 			}
 			if ( $has_inactive_themes ) {
 				$count = count( $this->inactive_themes );
-				$lines[] = '- ⚠ ' . $count . ' inactive theme' . ( 1 === $count ? '' : 's' ) . ' detected — not scanned; remove ' . ( 1 === $count ? 'it' : 'them' ) . ' if not needed.';
+				$lines[] = '- ⚠ ' . $count . ' inactive theme' . ( 1 === $count ? '' : 's' ) . ' detected — ' . ( $this->full_scan ? 'included in full scan' : 'not scanned' ) . '; remove ' . ( 1 === $count ? 'it' : 'them' ) . ' if not needed.';
 			}
 			$lines[] = '';
 		}
@@ -4300,13 +4353,13 @@ PHP;
 			if ( ! empty( $this->inactive_plugins ) ) {
 				$count = count( $this->inactive_plugins );
 				$lines[] = '[CLEANUP] Inactive plugins';
-				$lines[] = sprintf( '  %d inactive plugin%s detected and not scanned. Remove %s if not needed.', $count, 1 === $count ? '' : 's', 1 === $count ? 'it' : 'them' );
+				$lines[] = sprintf( '  %d inactive plugin%s detected and %s. Remove %s if not needed.', $count, 1 === $count ? '' : 's', $this->full_scan ? 'included in the full scan' : 'not scanned', 1 === $count ? 'it' : 'them' );
 				$lines[] = '';
 			}
 			if ( ! empty( $this->inactive_themes ) ) {
 				$count = count( $this->inactive_themes );
 				$lines[] = '[CLEANUP] Inactive themes';
-				$lines[] = sprintf( '  %d inactive theme%s detected and not scanned. Remove %s if not needed.', $count, 1 === $count ? '' : 's', 1 === $count ? 'it' : 'them' );
+				$lines[] = sprintf( '  %d inactive theme%s detected and %s. Remove %s if not needed.', $count, 1 === $count ? '' : 's', $this->full_scan ? 'included in the full scan' : 'not scanned', 1 === $count ? 'it' : 'them' );
 				$lines[] = '';
 			}
 		}

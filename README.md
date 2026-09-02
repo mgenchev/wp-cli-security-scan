@@ -6,14 +6,14 @@ The package is designed for a workflow where a site's `wp-content` directory and
 
 ## What it scans
 
-A full scan runs in separate stages:
+A standard scan runs in separate stages:
 
 1. WordPress core checksum verification (`wp core verify-checksums`)
 2. Plugin source/repository reputation
 3. WordPress.org plugin checksum verification
-4. Active plugins only
+4. Regular plugins in the selected scan scope (active only by default)
 5. MU plugins and WordPress drop-ins
-6. Active theme and its parent theme only
+6. Themes in the selected scan scope (active theme + parent by default)
 7. Uploads
 8. Other directories/files inside `wp-content`
 9. Database content
@@ -192,16 +192,19 @@ Detailed findings are intentionally not printed in the interactive terminal repo
 The final terminal summary includes severity counts, files scanned, database rows scanned, administrator count, total findings, and scan duration. Recommendations remain in the console so remediation actions are immediately visible, while the detailed findings log preserves the evidence needed for manual incident review.
 
 
-## Active-only plugin and theme scope
+## Plugin and theme scan scope
 
-Regular plugin and theme malware scanning is intentionally limited to code that can currently execute:
+The default scope remains intentionally focused on code that can currently execute:
 
 - only **active regular plugins** are reputation-checked, checksum-verified, and statically scanned;
-- inactive plugins are not scanned; their removal guidance is collected in the final Recommendations block;
 - only the **active theme** is scanned; when a child theme is active, its parent theme is scanned as well;
-- inactive themes are not scanned; their removal guidance is collected in the final Recommendations block.
+- inactive plugins/themes are still inventoried so cleanup guidance can be shown.
 
-MU plugins and WordPress drop-ins remain in scope because they are loaded independently of the normal active-plugin list.
+Use `--full-scan` when the incident requires coverage of inactive installed code as well:
+
+- inactive regular plugins enter the same reputation, WordPress.org checksum-integrity, and static-analysis pipeline as active plugins;
+- inactive themes are added to the static malware scan; theme checksum/integrity verification is intentionally not added;
+- MU plugins and WordPress drop-ins remain in scope in both modes because they load independently of the normal active-plugin list.
 
 Example startup scope feedback:
 
@@ -210,7 +213,32 @@ Plugin scope: active plugins only.
 Theme scope: active theme and parent theme only, when applicable.
 ```
 
-Inactive plugin/theme cleanup guidance is intentionally shown only once in the final Recommendations block.
+With `--full-scan`:
+
+```text
+Plugin scope: all installed regular plugins.
+Theme scope: all installed themes.
+```
+
+Inactive plugin/theme cleanup guidance is intentionally shown only once in the final Recommendations block. In full-scan mode it states that the inactive code was included in the scan while still recommending removal when it is not needed.
+
+
+## Full scan mode
+
+The default scan remains active-only for regular plugins/themes. To include inactive installed code:
+
+```bash
+wp security-scan --full-scan
+```
+
+The flag is also supported by the focused commands:
+
+```bash
+wp security-scan plugins --full-scan
+wp security-scan themes --full-scan
+```
+
+For plugins, full-scan mode includes inactive plugins in reputation checks, official checksum verification when available, and static malware analysis. For themes, it adds inactive themes to static malware analysis only.
 
 
 ## `node_modules`
@@ -261,7 +289,7 @@ Raw contents of database dumps, source maps and compressed archives are skipped 
 
 ## Plugin reputation
 
-Before checksum verification, the scanner classifies active plugin sources only. It sends one read-only bulk update-check request to WordPress.org for the active-plugin inventory, then resolves remaining repository lookups concurrently when cURL multi is available. A secure sequential WordPress HTTP fallback is used when parallel cURL is unavailable.
+Before checksum verification, the scanner classifies plugin sources for the selected scan scope. It sends one read-only bulk update-check request to WordPress.org for that plugin inventory, then resolves remaining repository lookups concurrently when cURL multi is available. A secure sequential WordPress HTTP fallback is used when parallel cURL is unavailable.
 
 Reputation currently distinguishes:
 
@@ -279,7 +307,7 @@ The reputation stage is read-only and does not call `wp_update_plugins()`, so it
 
 Plugin reputation is evaluated first, then local plugin integrity is checked directly against the official WordPress.org checksum manifest for the exact plugin slug/version. The scanner no longer starts a second WP-CLI/WordPress subprocess for this stage. Checksum manifests are downloaded concurrently when possible, then local files are hashed with SHA-256 (falling back to MD5 only when required by the official manifest).
 
-Integrity is an **internal remediation signal** and is intentionally not printed as its own completed stage, Findings section, risk score, checksum-status label, or JSON report section:
+Integrity remains an **internal remediation signal**. The live checklist shows only a concise completed integrity status, while detailed checksum state, numeric risk score, and raw manifest metadata remain internal rather than being exposed as standalone report fields:
 
 - matching official checksums suppress ordinary static heuristics from that WordPress.org plugin;
 - a local mismatch causes a strong fresh-copy recommendation;
@@ -430,4 +458,4 @@ Legitimate variable-variable assignments such as `$$key = $value` are not report
 
 ### Automatic scan log
 
-Every completed scan overwrites `security-scan.log` in the directory from which the scan was launched. The log is intended for manual incident review and uses separate Summary, Findings, and Recommendations blocks. Findings use a compact numbered layout showing severity, confidence, the problem, and every affected path/line. Repeated Uploads/plugin issues remain grouped where the existing grouping preserves the full evidence. Core checksum findings are grouped by checksum problem while retaining every affected core path. Plugin checksum/integrity changes are grouped by problem so added files and checksum mismatches can be reviewed together while preserving every affected plugin path. Interactive scans print the log path after the final Recommendations block so the detailed evidence is easy to locate.
+Every completed scan overwrites `security-scan.log` in the directory from which the scan was launched. The log is intended for manual incident review and uses separate Summary, Findings, and Recommendations blocks. Findings use a compact numbered layout showing severity, confidence, the problem, and every affected path/line. Repeated Uploads/plugin issues remain grouped where the existing grouping preserves the full evidence. Core checksum findings are grouped by checksum problem while retaining every affected core path. Plugin checksum/integrity changes are grouped by problem while preserving every affected plugin path. `Local file is not part of the official plugin package` means the local file exists inside the plugin directory but is absent from the official WordPress.org checksum manifest for that exact slug/version; it is an integrity mismatch, not by itself proof of malware. Interactive scans print the log path after the final Recommendations block so the detailed evidence is easy to locate.

@@ -5,7 +5,7 @@
             "slugs": ["wp-vcd"],
             "severity": "critical",
             "confidence": 99,
-            "description": "Plugin slug matches a known WordPress malware family"
+            "description": "Plugin slug matches known WordPress malware family: wp-vcd"
         }
     ]
 }

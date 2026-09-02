@@ -83,7 +83,7 @@ if ( 'modified' !== $state['sample-plugin']['status'] ) {
 }
 
 $messages = array_column( $state['sample-plugin']['checksum_errors'], 'message' );
-if ( ! in_array( 'File does not verify against checksum', $messages, true ) || ! in_array( 'File was added', $messages, true ) ) {
+if ( ! in_array( 'File differs from the official plugin checksum', $messages, true ) || ! in_array( 'Local file is not part of the official plugin package', $messages, true ) ) {
 	fwrite( STDERR, "Direct checksum verification must detect modified and added files.\n" );
 	exit( 1 );
 }
