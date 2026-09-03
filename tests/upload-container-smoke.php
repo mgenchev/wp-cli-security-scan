@@ -13,6 +13,8 @@ $command = new Security_Scan_Command();
 $reflection = new ReflectionClass( $command );
 $scan = $reflection->getMethod( 'scan_upload_media_container' );
 $scan->setAccessible( true );
+$scan_filename = $reflection->getMethod( 'scan_filename_and_location' );
+$scan_filename->setAccessible( true );
 $findings_property = $reflection->getProperty( 'findings' );
 $findings_property->setAccessible( true );
 
@@ -124,6 +126,41 @@ foreach ( $tests as $index => $test ) {
 		}
 	}
 
+	echo ( $ok ? 'PASS  ' : 'FAIL  ' ) . $test['name'] . PHP_EOL;
+	if ( ! $ok ) {
+		echo '      rules: ' . implode( ', ', $rules ) . PHP_EOL;
+		$failed++;
+	}
+}
+
+$guard_tests = [
+	[
+		'name' => 'comment-only upload index.php is treated as an inert guard',
+		'data' => "<?php\n// Silence is golden.\n",
+		'expect_upload_exec' => false,
+	],
+	[
+		'name' => 'exit-only upload index.php is treated as an inert guard',
+		'data' => "<?php exit;\n",
+		'expect_upload_exec' => false,
+	],
+	[
+		'name' => 'executable PHP in uploads remains reportable',
+		'data' => "<?php system( \$_POST['cmd'] );\n",
+		'expect_upload_exec' => true,
+	],
+];
+
+foreach ( $guard_tests as $index => $test ) {
+	$path = $tmp . DIRECTORY_SEPARATOR . 'guard-' . $index . '.php';
+	file_put_contents( $path, $test['data'] );
+	$findings_property->setValue( $command, [] );
+	$seen = [];
+	$args = [ 'Uploads', $path, 'uploads/' . basename( $path ), 'php', true, &$seen ];
+	$scan_filename->invokeArgs( $command, $args );
+	$rules = array_column( $findings_property->getValue( $command ), 'rule' );
+	$has_upload_exec = in_array( 'uploads_executable', $rules, true );
+	$ok = $has_upload_exec === $test['expect_upload_exec'];
 	echo ( $ok ? 'PASS  ' : 'FAIL  ' ) . $test['name'] . PHP_EOL;
 	if ( ! $ok ) {
 		echo '      rules: ' . implode( ', ', $rules ) . PHP_EOL;

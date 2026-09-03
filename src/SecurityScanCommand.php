@@ -126,6 +126,7 @@ class Security_Scan_Command {
 	private $active_theme_slugs = [];
 	private $inactive_themes = [];
 	private $launch_directory = '';
+	private $scan_log_path = '';
 	private $database = null;
 	private $wp_root = '';
 	private $content_dir = '';
@@ -148,6 +149,9 @@ class Security_Scan_Command {
 	private $plugin_sha256_available = null;
 	private $verified_plugin_ioc_rules = null;
 	private $table_column_cache = [];
+	private $finalization_active = false;
+	private $finalization_memory_reserve = '';
+	private $finalization_shutdown_registered = false;
 
 	/**
 	 * Run a complete security scan.
@@ -306,6 +310,7 @@ class Security_Scan_Command {
 		$this->suppress_wordpress_debug();
 		$this->start_time = microtime( true );
 		$this->launch_directory = $this->resolve_launch_directory();
+		$this->scan_log_path = $this->resolve_scan_log_path();
 
 		if ( $this->interactive ) {
 			$this->start_background_spinner( 'Security Scan — initializing isolated scanner...' );
@@ -315,6 +320,7 @@ class Security_Scan_Command {
 			$this->initialize_scanner_runtime();
 		} finally {
 			$this->stop_background_spinner();
+			$this->release_finalization_guard();
 		}
 
 		if ( $this->interactive ) {
@@ -426,6 +432,7 @@ class Security_Scan_Command {
 		$this->active_theme_slugs = [];
 		$this->inactive_themes = [];
 		$this->launch_directory = '';
+		$this->scan_log_path = '';
 		$this->database = null;
 		$this->wp_root = '';
 		$this->content_dir = '';
@@ -448,6 +455,8 @@ class Security_Scan_Command {
 		$this->plugin_sha256_available = null;
 		$this->verified_plugin_ioc_rules = null;
 		$this->table_column_cache = [];
+		$this->finalization_active = false;
+		$this->finalization_memory_reserve = '';
 	}
 
 	/**
@@ -471,7 +480,7 @@ class Security_Scan_Command {
 	 * themes, MU plugins and wp-content drop-ins out of the scanner process.
 	 */
 	private function initialize_scanner_runtime() {
-		$this->wp_root = defined( 'ABSPATH' ) ? rtrim( (string) ABSPATH, '/\\' ) : '';
+		$this->wp_root = defined( 'ABSPATH' ) ? rtrim( (string) constant( 'ABSPATH' ), '/\\' ) : '';
 		if ( '' === $this->wp_root || ! is_dir( $this->wp_root ) ) {
 			\WP_CLI::error( 'Unable to determine the WordPress root directory for isolated scanning.' );
 		}
@@ -486,22 +495,48 @@ class Security_Scan_Command {
 		$this->base_table_prefix = $this->validate_table_prefix( $table_prefix );
 
 		$this->content_dir = defined( 'WP_CONTENT_DIR' )
-			? rtrim( (string) WP_CONTENT_DIR, '/\\' )
+			? rtrim( (string) constant( 'WP_CONTENT_DIR' ), '/\\' )
 			: $this->wp_root . DIRECTORY_SEPARATOR . 'wp-content';
 		$this->plugin_dir = defined( 'WP_PLUGIN_DIR' )
-			? rtrim( (string) WP_PLUGIN_DIR, '/\\' )
+			? rtrim( (string) constant( 'WP_PLUGIN_DIR' ), '/\\' )
 			: $this->content_dir . DIRECTORY_SEPARATOR . 'plugins';
 		$this->mu_plugin_dir = defined( 'WPMU_PLUGIN_DIR' )
-			? rtrim( (string) WPMU_PLUGIN_DIR, '/\\' )
+			? rtrim( (string) constant( 'WPMU_PLUGIN_DIR' ), '/\\' )
 			: $this->content_dir . DIRECTORY_SEPARATOR . 'mu-plugins';
 		$this->theme_dir = $this->content_dir . DIRECTORY_SEPARATOR . 'themes';
 
+		$this->define_isolated_path_constants();
 		$this->initialize_scanner_database();
 		$this->resolve_current_site_prefix();
 		$this->site_home_host = $this->resolve_site_home_host();
 		$this->site_locale = $this->resolve_site_locale();
 		$this->active_plugin_files = $this->read_active_plugin_files();
 		$this->uploads_dir = $this->resolve_upload_directory();
+	}
+
+	/**
+	 * Define the standard WordPress content path constants that wp-settings.php
+	 * would normally provide after wp-config.php has been evaluated.
+	 *
+	 * The isolated scanner intentionally never loads wp-settings.php. Defining
+	 * these resolved path constants keeps WP-CLI/package code that expects the
+	 * standard constants compatible without loading or executing wp-content.
+	 * Existing custom constants from wp-config.php are always preserved.
+	 */
+	private function define_isolated_path_constants() {
+		$paths = [
+			'WP_CONTENT_DIR'  => $this->content_dir,
+			'WP_PLUGIN_DIR'   => $this->plugin_dir,
+			'WPMU_PLUGIN_DIR' => $this->mu_plugin_dir,
+		];
+
+		foreach ( $paths as $name => $path ) {
+			if ( defined( $name ) || '' === trim( (string) $path ) ) {
+				continue;
+			}
+
+			define( $name, $path );
+		}
 	}
 
 	/**
@@ -555,23 +590,23 @@ class Security_Scan_Command {
 			}
 		}
 
-		$charset = defined( 'DB_CHARSET' ) ? (string) DB_CHARSET : 'utf8mb4';
-		$flags = defined( 'MYSQL_CLIENT_FLAGS' ) ? (int) MYSQL_CLIENT_FLAGS : 0;
+		$charset = defined( 'DB_CHARSET' ) ? (string) constant( 'DB_CHARSET' ) : 'utf8mb4';
+		$flags = defined( 'MYSQL_CLIENT_FLAGS' ) ? (int) constant( 'MYSQL_CLIENT_FLAGS' ) : 0;
 
 		try {
 			$this->database = new Security_Scan_Database(
-				(string) DB_NAME,
-				(string) DB_USER,
-				(string) DB_PASSWORD,
-				(string) DB_HOST,
+				(string) constant( 'DB_NAME' ),
+				(string) constant( 'DB_USER' ),
+				(string) constant( 'DB_PASSWORD' ),
+				(string) constant( 'DB_HOST' ),
 				$charset,
 				$this->base_table_prefix,
 				$flags
 			);
 
 			$this->database->set_user_tables(
-				defined( 'CUSTOM_USER_TABLE' ) ? (string) CUSTOM_USER_TABLE : '',
-				defined( 'CUSTOM_USER_META_TABLE' ) ? (string) CUSTOM_USER_META_TABLE : ''
+				defined( 'CUSTOM_USER_TABLE' ) ? (string) constant( 'CUSTOM_USER_TABLE' ) : '',
+				defined( 'CUSTOM_USER_META_TABLE' ) ? (string) constant( 'CUSTOM_USER_META_TABLE' ) : ''
 			);
 		} catch ( \Throwable $e ) {
 			\WP_CLI::error( $e->getMessage() );
@@ -597,9 +632,9 @@ class Security_Scan_Command {
 		}
 
 		$blog_id = defined( 'BLOG_ID_CURRENT_SITE' )
-			? max( 1, (int) BLOG_ID_CURRENT_SITE )
-			: ( defined( 'BLOGID_CURRENT_SITE' ) ? max( 1, (int) BLOGID_CURRENT_SITE ) : 1 );
-		$network_id = defined( 'SITE_ID_CURRENT_SITE' ) ? max( 1, (int) SITE_ID_CURRENT_SITE ) : 1;
+			? max( 1, (int) constant( 'BLOG_ID_CURRENT_SITE' ) )
+			: ( defined( 'BLOGID_CURRENT_SITE' ) ? max( 1, (int) constant( 'BLOGID_CURRENT_SITE' ) ) : 1 );
+		$network_id = defined( 'SITE_ID_CURRENT_SITE' ) ? max( 1, (int) constant( 'SITE_ID_CURRENT_SITE' ) ) : 1;
 		$runner = \WP_CLI::get_runner();
 		$url = isset( $runner->assoc_args['url'] ) ? trim( (string) $runner->assoc_args['url'] ) : '';
 		if ( '' !== $url ) {
@@ -636,7 +671,7 @@ class Security_Scan_Command {
 	 */
 	private function scanner_is_multisite() {
 		if ( defined( 'MULTISITE' ) ) {
-			return (bool) MULTISITE;
+			return (bool) constant( 'MULTISITE' );
 		}
 
 		return defined( 'SUBDOMAIN_INSTALL' ) || defined( 'VHOST' ) || defined( 'SUNRISE' );
@@ -709,13 +744,13 @@ class Security_Scan_Command {
 		$network_id = max( 1, (int) $network_id );
 		if (
 			defined( 'SITE_ID_CURRENT_SITE' )
-			&& $network_id === (int) SITE_ID_CURRENT_SITE
+			&& $network_id === (int) constant( 'SITE_ID_CURRENT_SITE' )
 		) {
 			if ( defined( 'BLOG_ID_CURRENT_SITE' ) ) {
-				return max( 1, (int) BLOG_ID_CURRENT_SITE );
+				return max( 1, (int) constant( 'BLOG_ID_CURRENT_SITE' ) );
 			}
 			if ( defined( 'BLOGID_CURRENT_SITE' ) ) {
-				return max( 1, (int) BLOGID_CURRENT_SITE );
+				return max( 1, (int) constant( 'BLOGID_CURRENT_SITE' ) );
 			}
 		}
 
@@ -763,8 +798,8 @@ class Security_Scan_Command {
 		if ( ! $this->scanner_is_multisite() ) {
 			return 1;
 		}
-		if ( defined( 'PRIMARY_NETWORK_ID' ) && (int) PRIMARY_NETWORK_ID > 0 ) {
-			return (int) PRIMARY_NETWORK_ID;
+		if ( defined( 'PRIMARY_NETWORK_ID' ) && (int) constant( 'PRIMARY_NETWORK_ID' ) > 0 ) {
+			return (int) constant( 'PRIMARY_NETWORK_ID' );
 		}
 		if ( 1 === (int) $this->current_network_id ) {
 			return 1;
@@ -843,12 +878,12 @@ class Security_Scan_Command {
 	 * Resolve the site's canonical host for HTTP proxy bypass parity.
 	 */
 	private function resolve_site_home_host() {
-		$home = defined( 'WP_HOME' ) ? (string) WP_HOME : '';
+		$home = defined( 'WP_HOME' ) ? (string) constant( 'WP_HOME' ) : '';
 		if ( '' === trim( $home ) ) {
 			$home = $this->scanner_get_option( 'home', '' );
 		}
 		if ( ! is_string( $home ) || '' === trim( $home ) ) {
-			$home = defined( 'WP_SITEURL' ) ? (string) WP_SITEURL : '';
+			$home = defined( 'WP_SITEURL' ) ? (string) constant( 'WP_SITEURL' ) : '';
 		}
 		if ( '' === trim( (string) $home ) ) {
 			$home = $this->scanner_get_option( 'siteurl', '' );
@@ -870,7 +905,7 @@ class Security_Scan_Command {
 		$locale = trim( (string) ( $details['wp_local_package'] ?? '' ) );
 
 		if ( defined( 'WPLANG' ) ) {
-			$locale = trim( (string) WPLANG );
+			$locale = trim( (string) constant( 'WPLANG' ) );
 		}
 
 		$site_raw = $this->database ? $this->database->get_option_raw( 'WPLANG' ) : null;
@@ -997,7 +1032,7 @@ class Security_Scan_Command {
 		$ms_files_rewriting = $is_multisite && (bool) $this->scanner_get_network_option( 'ms_files_rewriting', false );
 
 		if ( defined( 'UPLOADS' ) && ! ( $is_multisite && $ms_files_rewriting ) ) {
-			$uploads = ltrim( str_replace( [ '/', '\\' ], DIRECTORY_SEPARATOR, (string) UPLOADS ), DIRECTORY_SEPARATOR );
+			$uploads = ltrim( str_replace( [ '/', '\\' ], DIRECTORY_SEPARATOR, (string) constant( 'UPLOADS' ) ), DIRECTORY_SEPARATOR );
 			$directory = $this->wp_root . DIRECTORY_SEPARATOR . $uploads;
 		}
 
@@ -1013,10 +1048,10 @@ class Security_Scan_Command {
 						: [ (string) $this->current_blog_id ];
 					$directory = rtrim( $directory, '/\\' ) . DIRECTORY_SEPARATOR . implode( DIRECTORY_SEPARATOR, $segment );
 				} elseif ( defined( 'UPLOADS' ) ) {
-					if ( defined( 'BLOGUPLOADDIR' ) && '' !== trim( (string) BLOGUPLOADDIR ) ) {
-						$directory = rtrim( (string) BLOGUPLOADDIR, '/\\' );
+					if ( defined( 'BLOGUPLOADDIR' ) && '' !== trim( (string) constant( 'BLOGUPLOADDIR' ) ) ) {
+						$directory = rtrim( (string) constant( 'BLOGUPLOADDIR' ), '/\\' );
 					} else {
-						$uploads = ltrim( str_replace( [ '/', '\\' ], DIRECTORY_SEPARATOR, (string) UPLOADS ), DIRECTORY_SEPARATOR );
+						$uploads = ltrim( str_replace( [ '/', '\\' ], DIRECTORY_SEPARATOR, (string) constant( 'UPLOADS' ) ), DIRECTORY_SEPARATOR );
 						$directory = $this->wp_root . DIRECTORY_SEPARATOR . $uploads;
 					}
 				}
@@ -2046,7 +2081,7 @@ class Security_Scan_Command {
 	 * Honor trusted WP_HTTP_BLOCK_EXTERNAL/WP_ACCESSIBLE_HOSTS configuration.
 	 */
 	private function scanner_http_external_policy_allows( $url ) {
-		if ( ! defined( 'WP_HTTP_BLOCK_EXTERNAL' ) || ! WP_HTTP_BLOCK_EXTERNAL ) {
+		if ( ! defined( 'WP_HTTP_BLOCK_EXTERNAL' ) || ! (bool) constant( 'WP_HTTP_BLOCK_EXTERNAL' ) ) {
 			return true;
 		}
 
@@ -2061,7 +2096,7 @@ class Security_Scan_Command {
 			return false;
 		}
 
-		return $this->scanner_http_host_matches_list( $host, (string) WP_ACCESSIBLE_HOSTS );
+		return $this->scanner_http_host_matches_list( $host, (string) constant( 'WP_ACCESSIBLE_HOSTS' ) );
 	}
 
 	/**
@@ -2096,8 +2131,8 @@ class Security_Scan_Command {
 			return null;
 		}
 
-		$proxy_host = trim( (string) WP_PROXY_HOST );
-		$proxy_port = (int) WP_PROXY_PORT;
+		$proxy_host = trim( (string) constant( 'WP_PROXY_HOST' ) );
+		$proxy_port = (int) constant( 'WP_PROXY_PORT' );
 		$request_host = strtolower( (string) parse_url( (string) $url, PHP_URL_HOST ) );
 		if ( '' === $proxy_host || $proxy_port < 1 || $proxy_port > 65535 || '' === $request_host ) {
 			return null;
@@ -2108,7 +2143,7 @@ class Security_Scan_Command {
 		}
 
 		if ( defined( 'WP_PROXY_BYPASS_HOSTS' ) ) {
-			$bypass_hosts = preg_split( '/,\s*/', (string) WP_PROXY_BYPASS_HOSTS, -1, PREG_SPLIT_NO_EMPTY );
+			$bypass_hosts = preg_split( '/,\s*/', (string) constant( 'WP_PROXY_BYPASS_HOSTS' ), -1, PREG_SPLIT_NO_EMPTY );
 			foreach ( $bypass_hosts as $bypass_host ) {
 				$bypass_host = trim( (string) $bypass_host );
 				if ( '' === $bypass_host ) {
@@ -2133,7 +2168,7 @@ class Security_Scan_Command {
 		];
 
 		if ( defined( 'WP_PROXY_USERNAME' ) && defined( 'WP_PROXY_PASSWORD' ) ) {
-			$proxy['auth'] = (string) WP_PROXY_USERNAME . ':' . (string) WP_PROXY_PASSWORD;
+			$proxy['auth'] = (string) constant( 'WP_PROXY_USERNAME' ) . ':' . (string) constant( 'WP_PROXY_PASSWORD' );
 		}
 
 		return $proxy;
@@ -2639,6 +2674,10 @@ class Security_Scan_Command {
 		$filter = new \RecursiveCallbackFilterIterator(
 			$directory_iterator,
 			function ( $current ) {
+				if ( $this->is_scanner_output_path( $current->getPathname() ) ) {
+					return false;
+				}
+
 				if ( $current->isDir() && ! $current->isLink() ) {
 					$name = strtolower( $current->getFilename() );
 
@@ -3049,6 +3088,10 @@ class Security_Scan_Command {
 				continue;
 			}
 
+			if ( $this->is_scanner_output_path( $path ) ) {
+				continue;
+			}
+
 			if ( $item->isLink() ) {
 				$this->scan_symlink( $stage, $path );
 				continue;
@@ -3429,7 +3472,9 @@ class Security_Scan_Command {
 		}
 
 		if ( $is_uploads && in_array( $extension, self::UPLOAD_EXECUTABLE_EXTENSIONS, true ) ) {
-			$this->add_file_finding_once( $seen, $stage, 'high', 96, $relative, 'uploads_executable', 'Executable/script file found inside uploads' );
+			if ( ! $this->is_inert_upload_php_guard_file( $path, $extension ) ) {
+				$this->add_file_finding_once( $seen, $stage, 'high', 96, $relative, 'uploads_executable', 'Executable/script file found inside uploads' );
+			}
 		}
 
 		if ( preg_match( '~\.(?:jpe?g|png|gif|webp|svg|ico|pdf|zip)\.(?:php\d*|phtml|phar)$~i', $filename ) ) {
@@ -3457,6 +3502,59 @@ class Security_Scan_Command {
 				$this->add_file_finding_once( $seen, $stage, 'critical', 98, $relative, 'htaccess_php_handler', '.htaccess enables PHP execution for additional file types', $line );
 			}
 		}
+	}
+
+	/**
+	 * Return true for empty/comment-only PHP guard files in uploads.
+	 *
+	 * WordPress plugins commonly place inert index.php files in writable upload
+	 * directories to prevent directory listing. Suppress only the generic upload
+	 * executable-location finding when tokenization proves there is no executable
+	 * behavior beyond an optional exit/die statement. The normal content scanners
+	 * still inspect the file, so IOC/semantic findings remain available.
+	 */
+	private function is_inert_upload_php_guard_file( $path, $extension ) {
+		if ( ! in_array( strtolower( (string) $extension ), [ 'php', 'php3', 'php4', 'php5', 'php7', 'php8', 'phtml' ], true ) ) {
+			return false;
+		}
+
+		$size = @filesize( $path );
+		if ( false === $size || $size > 16384 ) {
+			return false;
+		}
+
+		$content = @file_get_contents( $path );
+		if ( ! is_string( $content ) ) {
+			return false;
+		}
+
+		$tokens = token_get_all( $content );
+		$has_exit = false;
+		foreach ( $tokens as $token ) {
+			if ( is_array( $token ) ) {
+				if ( in_array( $token[0], [ T_OPEN_TAG, T_CLOSE_TAG, T_WHITESPACE, T_COMMENT, T_DOC_COMMENT ], true ) ) {
+					continue;
+				}
+				if ( T_EXIT === $token[0] ) {
+					$has_exit = true;
+					continue;
+				}
+				if ( $has_exit && in_array( $token[0], [ T_CONSTANT_ENCAPSED_STRING, T_LNUMBER, T_DNUMBER ], true ) ) {
+					continue;
+				}
+				return false;
+			}
+
+			if ( $has_exit && in_array( $token, [ '(', ')', ';' ], true ) ) {
+				continue;
+			}
+			if ( ';' === $token ) {
+				continue;
+			}
+			return false;
+		}
+
+		return true;
 	}
 
 	/**
@@ -3521,7 +3619,125 @@ class Security_Scan_Command {
 					$this->add_file_rule_once( $seen, $stage, $relative, $rule, $line );
 				}
 			}
+
+			$this->scan_javascript_sensitive_external_transfer( $stage, $relative, $buffer, $seen, $buffer_start_line );
 		}
+	}
+
+	/**
+	 * Detect direct browser credential/payment skimmers without requiring JS obfuscation.
+	 *
+	 * A finding requires three independent signals in one bounded neighborhood:
+	 * a sensitive browser source, a network API, and a literal HTTP(S) target whose
+	 * host is not the current WordPress host. This avoids classifying local AJAX or
+	 * ordinary checkout-field handling as exfiltration by itself.
+	 */
+	private function scan_javascript_sensitive_external_transfer( $stage, $location, $buffer, array &$seen, $buffer_start_line = null ) {
+		$rule = 'js_sensitive_external_transfer';
+		if ( isset( $seen[ $rule ] ) ) {
+			return;
+		}
+
+		if ( ! preg_match( '~(?:document\\.cookie|getElementById|querySelector|FormData|\\.get\\s*\\()~i', $buffer ) ) {
+			return;
+		}
+		if ( ! preg_match( '~(?:fetch\\s*\\(|\\.open\\s*\\(|sendBeacon\\s*\\(|new\\s+WebSocket\\s*\\(|\\$\\.(?:post|ajax)\\s*\\()~i', $buffer ) ) {
+			return;
+		}
+
+		$sink_patterns = [
+			'~\\bfetch\\s*\\(\\s*([\\\'\"])(https?://[^\\\'\"]+)\\1~i',
+			'~\\bsendBeacon\\s*\\(\\s*([\\\'\"])(https?://[^\\\'\"]+)\\1~i',
+			'~\\.open\\s*\\(\\s*([\\\'\"])(?:GET|POST|PUT|PATCH)\\1\\s*,\\s*([\\\'\"])(https?://[^\\\'\"]+)\\2~i',
+			'~\\bnew\\s+WebSocket\\s*\\(\\s*([\\\'\"])(https?://[^\\\'\"]+)\\1~i',
+			'~\\$\\.post\\s*\\(\\s*([\\\'\"])(https?://[^\\\'\"]+)\\1~i',
+			'~\\$\\.ajax\\s*\\(\\s*\\{[\\s\\S]{0,800}?\\burl\\s*:\\s*([\\\'\"])(https?://[^\\\'\"]+)\\1~i',
+		];
+
+		foreach ( $sink_patterns as $pattern ) {
+			$matches = [];
+			if ( ! preg_match_all( $pattern, $buffer, $matches, PREG_SET_ORDER | PREG_OFFSET_CAPTURE ) ) {
+				continue;
+			}
+
+			foreach ( $matches as $match ) {
+				$url = '';
+				$url_offset = null;
+				for ( $i = count( $match ) - 1; $i >= 1; $i-- ) {
+					if ( isset( $match[ $i ][0] ) && is_string( $match[ $i ][0] ) && preg_match( '~^https?://~i', $match[ $i ][0] ) ) {
+						$url = $match[ $i ][0];
+						$url_offset = $match[ $i ][1];
+						break;
+					}
+				}
+				if ( '' === $url || ! $this->javascript_url_is_external( $url ) ) {
+					continue;
+				}
+
+				$sink_offset = isset( $match[0][1] ) ? (int) $match[0][1] : (int) $url_offset;
+				$start = max( 0, $sink_offset - 4096 );
+				$window = substr( $buffer, $start, min( 8192, strlen( $buffer ) - $start ) );
+				if ( ! $this->javascript_window_has_sensitive_source( $window ) ) {
+					continue;
+				}
+
+				$seen[ $rule ] = true;
+				$line = null;
+				if ( null !== $buffer_start_line ) {
+					$line = $this->line_from_buffer_offset( $buffer, (int) $buffer_start_line, $sink_offset );
+				}
+				$this->add_finding( $stage, 'high', 95, $location, $rule, 'Sensitive browser form/session data is sent to an external JavaScript endpoint', $line );
+				return;
+			}
+		}
+	}
+
+	/**
+	 * Return true when a bounded JS window contains a credential/session/payment source.
+	 */
+	private function javascript_window_has_sensitive_source( $window ) {
+		if ( preg_match( '~\\bdocument\\.cookie\\b~i', $window ) ) {
+			return true;
+		}
+
+		$sensitive = '(?:password|passwd|passphrase|pwd|card[_-]?(?:number|no)?|credit[_-]?card|cc[_-]?(?:num|number|no)|cc_num|cc_cid|pan|cvv|cvc|card[_-]?security|expiry|expiration|access[_-]?token|auth[_-]?token|bearer|jwt)';
+		$patterns = [
+			'~(?:getElementById|querySelector|querySelectorAll)\\s*\\(\\s*[\\\'\"][^\\\'\"]{0,180}' . $sensitive . '[^\\\'\"]*[\\\'\"]\\s*\\)[^;\\r\\n]{0,180}\\.value\\b~i',
+			'~\\b(?:formData|data|payload)\\s*\\.get\\s*\\(\\s*[\\\'\"]' . $sensitive . '[\\\'\"]\\s*\\)~i',
+			'~\\b(?:password|passwd|cardNumber|card_number|cc_num|cvv|cvc|cc_cid|accessToken|authToken)\\s*[:=][^;\\r\\n]{0,240}(?:\\.value\\b|document\\.cookie)~i',
+		];
+		foreach ( $patterns as $pattern ) {
+			if ( preg_match( $pattern, $window ) ) {
+				return true;
+			}
+		}
+
+		return false;
+	}
+
+	/**
+	 * Compare a literal JS endpoint with the canonical WordPress host.
+	 */
+	private function javascript_url_is_external( $url ) {
+		$host = parse_url( (string) $url, PHP_URL_HOST );
+		if ( ! is_string( $host ) || '' === trim( $host ) ) {
+			return false;
+		}
+
+		$host = strtolower( trim( $host, " .\\t\\r\\n" ) );
+		if ( in_array( $host, [ 'localhost', '127.0.0.1', '::1' ], true ) ) {
+			return false;
+		}
+
+		$site = strtolower( trim( (string) $this->site_home_host, " .\\t\\r\\n" ) );
+		if ( '' === $site ) {
+			return true;
+		}
+
+		$normalize = static function ( $value ) {
+			return 0 === strpos( $value, 'www.' ) ? substr( $value, 4 ) : $value;
+		};
+		return $normalize( $host ) !== $normalize( $site );
 	}
 
 	/**
@@ -3713,11 +3929,9 @@ class Security_Scan_Command {
 
 		$execution_tokens = [
 			'eval(',
-			'assert(',
 			'shell_exec(',
 			'passthru(',
 			'proc_open(',
-			'call_user_func(',
 		];
 
 		$obfuscation_tokens = [
@@ -3726,7 +3940,6 @@ class Security_Scan_Command {
 			'gzuncompress(',
 			'str_rot13(',
 			'strrev(',
-			'str_repeat(',
 			'openssl_decrypt(',
 		];
 
@@ -3743,16 +3956,21 @@ class Security_Scan_Command {
 		$obfuscation_count = $this->count_present_tokens( $lower, $obfuscation_tokens );
 		$untrusted_count = $this->count_present_tokens( $lower, $untrusted_tokens );
 
-		// Density is only a reportable heuristic when several independent
-		// malware properties occur together. Common libraries legitimately use
-		// crypto/encoding primitives, callbacks and request data in isolation.
+		// Density is only reportable when the independent signals are also close
+		// enough to plausibly belong to the same behavior. Large libraries often
+		// contain these primitives in unrelated functions hundreds of lines apart.
 		if ( $execution_count >= 1 && $obfuscation_count >= 2 && $untrusted_count >= 1 ) {
-			$first_offset = $this->first_present_token_offset(
+			$cluster_offset = $this->find_density_signal_cluster(
 				$lower,
-				array_merge( $execution_tokens, $obfuscation_tokens, $untrusted_tokens )
+				$execution_tokens,
+				$obfuscation_tokens,
+				$untrusted_tokens,
+				4096
 			);
-			$line = null === $first_offset ? null : $this->line_from_buffer_offset( $buffer, $buffer_start_line, $first_offset );
-			$this->add_file_finding_once( $seen, $stage, 'high', 88, $relative, 'dense_suspicious_php', 'Execution, obfuscation and untrusted-input primitives occur together', $line );
+			if ( null !== $cluster_offset ) {
+				$line = $this->line_from_buffer_offset( $buffer, $buffer_start_line, $cluster_offset );
+				$this->add_file_finding_once( $seen, $stage, 'high', 88, $relative, 'dense_suspicious_php', 'Execution, obfuscation and untrusted-input primitives occur together', $line );
+			}
 		}
 
 		$long_line_matches = [];
@@ -3760,6 +3978,27 @@ class Security_Scan_Command {
 			$line = $this->line_from_buffer_offset( $buffer, $buffer_start_line, $long_line_matches[0][1] );
 			$this->add_file_finding_once( $seen, $stage, 'high', 86, $relative, 'long_obfuscated_line', 'Very long PHP line combines obfuscation with an execution primitive', $line );
 		}
+	}
+
+	/**
+	 * Confirm that density signals occur in one bounded neighborhood rather
+	 * than merely somewhere in the same large PHP file/chunk.
+	 */
+	private function find_density_signal_cluster( $buffer, array $execution_tokens, array $obfuscation_tokens, array $untrusted_tokens, $radius ) {
+		$length = strlen( $buffer );
+		foreach ( $execution_tokens as $execution_token ) {
+			$offset = 0;
+			while ( false !== ( $execution_offset = strpos( $buffer, $execution_token, $offset ) ) ) {
+				$start = max( 0, $execution_offset - $radius );
+				$window = substr( $buffer, $start, min( $length - $start, ( 2 * $radius ) + strlen( $execution_token ) ) );
+				if ( $this->count_present_tokens( $window, $obfuscation_tokens ) >= 2 && $this->count_present_tokens( $window, $untrusted_tokens ) >= 1 ) {
+					return $execution_offset;
+				}
+				$offset = $execution_offset + max( 1, strlen( $execution_token ) );
+			}
+		}
+
+		return null;
 	}
 
 	/**
@@ -4166,6 +4405,8 @@ class Security_Scan_Command {
 		$seen = [];
 		$location = $this->database_location( $table, $pk, $row, $field, $context_fields );
 
+		$this->scan_known_persistence_option_name( $stage, $table, $row, $field, $location, $seen );
+
 		foreach ( $this->rules['iocs'] as $rule ) {
 			if ( false !== stripos( $value, $rule['needle'] ) ) {
 				$key = $rule['id'];
@@ -4194,7 +4435,7 @@ class Security_Scan_Command {
 		// A <script> tag is normal in many WordPress settings and custom-code
 		// fields. Only report JavaScript when it matches a stronger behavioral
 		// rule such as obfuscated execution, hidden iframe or decoded redirect.
-		if ( preg_match( '~(?:<script\b|<iframe\b|\beval\s*\(|\batob\s*\(|fromCharCode|javascript\s*:|location\.)~i', $value ) ) {
+		if ( preg_match( '~(?:<script\b|<iframe\b|\beval\s*\(|\batob\s*\(|fromCharCode|javascript\s*:|location\.|clipboard\.writeText|execCommand\s*\(|powershell(?:\.exe)?|cmd\.exe)~i', $value ) ) {
 			foreach ( $this->rules['javascript'] as $rule ) {
 				if ( ! @preg_match( $rule['regex'], $value ) ) {
 					continue;
@@ -4209,6 +4450,53 @@ class Security_Scan_Command {
 				$this->add_finding( $stage, $rule['severity'], $rule['confidence'], $location, $key, $rule['description'] );
 			}
 		}
+
+		$this->scan_javascript_sensitive_external_transfer( $stage, $location, $value, $seen, null );
+	}
+
+	/**
+	 * Detect exact wp_options keys tied to documented WordPress persistence campaigns.
+	 *
+	 * The match is intentionally limited to the option_name column context rather
+	 * than searching these strings globally in source files or documentation.
+	 */
+	private function scan_known_persistence_option_name( $stage, $table, array $row, $field, $location, array &$seen ) {
+		if ( ! $this->database || $table !== $this->database->options || 'option_value' !== $field ) {
+			return;
+		}
+
+		$option_name = isset( $row['option_name'] ) ? (string) $row['option_name'] : '';
+		$known = [
+			'_hdra_core' => [
+				'severity'   => 'critical',
+				'confidence' => 98,
+				'rule'       => 'db_known_persistence_option_hdra_core',
+				'description'=> 'Known MU-plugin backdoor payload-storage option is present',
+			],
+			'_pre_user_id' => [
+				'severity'   => 'high',
+				'confidence' => 97,
+				'rule'       => 'db_known_persistence_option_pre_user_id',
+				'description'=> 'Known hidden-administrator persistence option is present',
+			],
+			'API_SN_CLOUDSERVER' => [
+				'severity'   => 'high',
+				'confidence' => 96,
+				'rule'       => 'db_known_persistence_option_cloudserver',
+				'description'=> 'Known hidden-plugin command-and-control option is present',
+			],
+		];
+
+		if ( ! isset( $known[ $option_name ] ) ) {
+			return;
+		}
+
+		$rule = $known[ $option_name ];
+		if ( isset( $seen[ $rule['rule'] ] ) ) {
+			return;
+		}
+		$seen[ $rule['rule'] ] = true;
+		$this->add_finding( $stage, $rule['severity'], $rule['confidence'], $location, $rule['rule'], $rule['description'] );
 	}
 
 	/**
@@ -5245,21 +5533,43 @@ PHP;
 			\WP_CLI::error( 'Invalid --min-severity. Use low, medium, high, or critical.' );
 		}
 
-		$reportable_findings = $this->filter_findings_for_plugin_integrity( $this->findings );
+		$this->prepare_finalization_guard();
+		if ( $this->interactive ) {
+			$this->start_background_spinner( 'Security Scan — finalizing report...' );
+		}
 
-		$filtered = array_values(
-			array_filter(
-				$reportable_findings,
-				function ( $finding ) use ( $min_severity ) {
-					return self::SEVERITY_WEIGHT[ $finding['severity'] ] >= self::SEVERITY_WEIGHT[ $min_severity ];
+		try {
+			// Apply checksum trust and min-severity in one pass. Building an
+			// intermediate reportable-finding array here can briefly duplicate a large
+			// finding set at the exact point where heavily compromised sites have the
+			// highest memory pressure.
+			$filtered = [];
+			foreach ( $this->findings as $finding ) {
+				if ( ! $this->finding_passes_plugin_integrity_policy( $finding ) ) {
+					continue;
 				}
-			)
-		);
+				if ( self::SEVERITY_WEIGHT[ $finding['severity'] ] < self::SEVERITY_WEIGHT[ $min_severity ] ) {
+					continue;
+				}
+				$filtered[] = $finding;
+			}
+			$this->findings = [];
+			if ( function_exists( 'gc_collect_cycles' ) ) {
+				gc_collect_cycles();
+			}
 
-		usort( $filtered, [ $this, 'sort_findings' ] );
+			usort( $filtered, [ $this, 'sort_findings' ] );
 
-		$report = $this->build_report( $filtered );
-		$scan_log_path = $this->write_scan_log( $report );
+			$report = $this->build_report( $filtered );
+			$scan_log_path = $this->write_scan_log( $report );
+		} catch ( \Throwable $exception ) {
+			\WP_CLI::error(
+				'Security report finalization failed: ' . $exception->getMessage()
+				. ' (' . basename( $exception->getFile() ) . ':' . $exception->getLine() . ')'
+			);
+		} finally {
+			$this->stop_background_spinner();
+		}
 		$output_file = isset( $assoc_args['output'] ) ? (string) $assoc_args['output'] : '';
 
 		if ( 'json' === $this->format ) {
@@ -5275,6 +5585,57 @@ PHP;
 		}
 
 		$this->render_terminal_report( $report, $scan_log_path );
+	}
+
+
+	/**
+	 * Keep a small memory reserve so fatal report-finalization errors can be
+	 * surfaced even when normal PHP error display is disabled.
+	 */
+	private function prepare_finalization_guard() {
+		$this->finalization_active = true;
+		$this->finalization_memory_reserve = str_repeat( 'R', 262144 );
+
+		if ( $this->finalization_shutdown_registered ) {
+			return;
+		}
+
+		$this->finalization_shutdown_registered = true;
+		register_shutdown_function(
+			function () {
+				$this->handle_finalization_shutdown();
+			}
+		);
+	}
+
+	/**
+	 * Disable the report-finalization fatal guard after a normal completion.
+	 */
+	private function release_finalization_guard() {
+		$this->finalization_active = false;
+		$this->finalization_memory_reserve = '';
+	}
+
+	/**
+	 * Surface otherwise-hidden fatal errors that occur after the scan stages.
+	 *
+	 * OS-level SIGKILL/OOM termination cannot be intercepted here, but ordinary
+	 * PHP fatal/memory-limit failures will now leave a useful diagnostic.
+	 */
+	private function handle_finalization_shutdown() {
+		if ( ! $this->finalization_active ) {
+			return;
+		}
+
+		$error = error_get_last();
+		if ( ! is_array( $error ) || ! in_array( (int) ( $error['type'] ?? 0 ), [ E_ERROR, E_PARSE, E_CORE_ERROR, E_COMPILE_ERROR ], true ) ) {
+			return;
+		}
+
+		$this->finalization_memory_reserve = '';
+		$message = preg_replace( '/[\x00-\x1F\x7F]+/', ' ', (string) ( $error['message'] ?? 'Unknown fatal error' ) );
+		$message = trim( preg_replace( '/\s+/', ' ', (string) $message ) );
+		@fwrite( STDERR, PHP_EOL . 'Error: Security report finalization terminated: ' . $message . PHP_EOL );
 	}
 
 	/**
@@ -5356,19 +5717,7 @@ PHP;
 		$filtered = [];
 
 		foreach ( $findings as $finding ) {
-			if ( 'Plugin integrity' === $finding['section'] ) {
-				continue;
-			}
-
-			if ( 'Plugins' !== $finding['section'] ) {
-				$filtered[] = $finding;
-				continue;
-			}
-
-			$plugin = $this->plugin_slug_from_location( $finding['location'] );
-			$status = $this->plugin_integrity_status( $plugin );
-
-			if ( 'verified' !== $status || $this->is_verified_plugin_risk_finding( $finding ) ) {
+			if ( $this->finding_passes_plugin_integrity_policy( $finding ) ) {
 				$filtered[] = $finding;
 			}
 		}
@@ -5377,12 +5726,30 @@ PHP;
 	}
 
 	/**
+	 * Return whether one finding survives the plugin-integrity trust policy.
+	 */
+	private function finding_passes_plugin_integrity_policy( array $finding ) {
+		if ( 'Plugin integrity' === ( $finding['section'] ?? '' ) ) {
+			return false;
+		}
+
+		if ( 'Plugins' !== ( $finding['section'] ?? '' ) ) {
+			return true;
+		}
+
+		$plugin = $this->plugin_slug_from_location( $finding['location'] ?? '' );
+		$status = $this->plugin_integrity_status( $plugin );
+
+		return 'verified' !== $status || $this->is_verified_plugin_risk_finding( $finding );
+	}
+
+	/**
 	 * Count plugin findings that will actually be shown after checksum trust.
 	 */
 	private function count_reportable_plugin_findings() {
 		$count = 0;
-		foreach ( $this->filter_findings_for_plugin_integrity( $this->findings ) as $finding ) {
-			if ( 'Plugins' === $finding['section'] ) {
+		foreach ( $this->findings as $finding ) {
+			if ( 'Plugins' === ( $finding['section'] ?? '' ) && $this->finding_passes_plugin_integrity_policy( $finding ) ) {
 				$count++;
 			}
 		}
@@ -6440,13 +6807,37 @@ PHP;
 	 * Write a complete human-readable scan log, replacing the previous scan log.
 	 */
 	private function write_scan_log( array $report ) {
-		$directory = '' !== $this->launch_directory ? $this->launch_directory : $this->resolve_launch_directory();
-		$path = rtrim( $directory, '/\\' ) . DIRECTORY_SEPARATOR . 'security-scan.log';
+		$path = '' !== $this->scan_log_path ? $this->scan_log_path : $this->resolve_scan_log_path();
 		$content = $this->render_scan_log( $report );
 		if ( false === @file_put_contents( $path, $content, LOCK_EX ) ) {
 			return null;
 		}
 		return $path;
+	}
+
+	/**
+	 * Resolve the exact scanner-owned log path for this run.
+	 */
+	private function resolve_scan_log_path() {
+		$directory = '' !== $this->launch_directory ? $this->launch_directory : $this->resolve_launch_directory();
+		return rtrim( $directory, '/\\' ) . DIRECTORY_SEPARATOR . 'security-scan.log';
+	}
+
+	/**
+	 * Whether a filesystem path is owned by the scanner itself.
+	 *
+	 * Only the exact log path selected for the current run is excluded. A file
+	 * with the same basename elsewhere in wp-content remains in scan scope.
+	 */
+	private function is_scanner_output_path( $path ) {
+		if ( '' === $this->scan_log_path ) {
+			return false;
+		}
+
+		$expected = rtrim( $this->normalize_path( $this->scan_log_path ), '/' );
+		$current = rtrim( $this->normalize_path( $path ), '/' );
+
+		return '' !== $expected && $expected === $current;
 	}
 
 	/**
@@ -6477,15 +6868,15 @@ PHP;
 			}
 		}
 
-		return defined( 'ABSPATH' ) ? rtrim( ABSPATH, '/\\' ) : '.';
+		return defined( 'ABSPATH' ) ? rtrim( (string) constant( 'ABSPATH' ), '/\\' ) : '.';
 	}
 
 	/**
-	 * Render the scan timestamp in the site's local timezone without loading WordPress.
+	 * Render the scan timestamp in the local timezone of the machine running WP-CLI.
 	 *
-	 * WordPress stores either an IANA timezone in timezone_string or a numeric
-	 * gmt_offset. The PHP/process timezone is used only when neither site setting
-	 * can be resolved safely.
+	 * The scanner intentionally ignores the WordPress site's timezone here. It
+	 * prefers explicit machine/process timezone signals and falls back to UTC when
+	 * the host timezone cannot be determined without executing external commands.
 	 */
 	private function resolve_scan_log_timestamp( $timestamp ) {
 		try {
@@ -6494,43 +6885,53 @@ PHP;
 			$instant = new \DateTimeImmutable( 'now', new \DateTimeZone( 'UTC' ) );
 		}
 
-		$timezone = $this->resolve_site_timezone();
-		return $instant->setTimezone( $timezone )->format( 'c' );
+		return $instant->setTimezone( $this->resolve_machine_timezone() )->format( 'c' );
 	}
 
 	/**
-	 * Resolve the site's configured timezone without WordPress date/time APIs.
+	 * Resolve the machine/CLI timezone without shelling out or loading WordPress.
 	 */
-	private function resolve_site_timezone() {
-		$timezone_string = $this->scanner_get_option( 'timezone_string', '' );
-		if ( is_string( $timezone_string ) && '' !== trim( $timezone_string ) ) {
+	private function resolve_machine_timezone() {
+		$candidates = [];
+
+		$environment_timezone = getenv( 'TZ' );
+		if ( is_string( $environment_timezone ) && '' !== trim( $environment_timezone ) ) {
+			$candidates[] = ltrim( trim( $environment_timezone ), ':' );
+		}
+
+		if ( is_readable( '/etc/timezone' ) ) {
+			$system_timezone = trim( (string) @file_get_contents( '/etc/timezone' ) );
+			if ( '' !== $system_timezone ) {
+				$candidates[] = $system_timezone;
+			}
+		}
+
+		$localtime_link = @readlink( '/etc/localtime' );
+		if ( is_string( $localtime_link ) && '' !== $localtime_link ) {
+			$marker = '/zoneinfo/';
+			$position = strpos( str_replace( '\\', '/', $localtime_link ), $marker );
+			if ( false !== $position ) {
+				$candidates[] = substr( str_replace( '\\', '/', $localtime_link ), $position + strlen( $marker ) );
+			}
+		}
+
+		$php_timezone = trim( (string) ini_get( 'date.timezone' ) );
+		if ( '' !== $php_timezone ) {
+			$candidates[] = $php_timezone;
+		}
+
+		foreach ( array_unique( $candidates ) as $candidate ) {
+			if ( '' === $candidate ) {
+				continue;
+			}
 			try {
-				return new \DateTimeZone( trim( $timezone_string ) );
+				return new \DateTimeZone( $candidate );
 			} catch ( \Exception $exception ) {
-				// Fall through to the numeric offset/process timezone fallback.
+				// Try the next machine-local timezone signal.
 			}
 		}
 
-		$gmt_offset = $this->scanner_get_option( 'gmt_offset', null );
-		if ( is_numeric( $gmt_offset ) ) {
-			$offset = (float) $gmt_offset;
-			if ( $offset >= -14.0 && $offset <= 14.0 ) {
-				$minutes = (int) round( abs( $offset ) * 60 );
-				$sign = $offset < 0 ? '-' : '+';
-				$name = sprintf( '%s%02d:%02d', $sign, intdiv( $minutes, 60 ), $minutes % 60 );
-				try {
-					return new \DateTimeZone( $name );
-				} catch ( \Exception $exception ) {
-					// Fall through to the process timezone.
-				}
-			}
-		}
-
-		try {
-			return new \DateTimeZone( date_default_timezone_get() );
-		} catch ( \Exception $exception ) {
-			return new \DateTimeZone( 'UTC' );
-		}
+		return new \DateTimeZone( 'UTC' );
 	}
 
 	/**
@@ -6597,11 +6998,11 @@ PHP;
 				$integrity_groups = $this->group_plugin_integrity_changes_by_problem();
 				foreach ( $integrity_groups as $problem => $integrity_group ) {
 					$lines[] = '[CRITICAL] Plugin integrity changes';
-					$lines[] = 'Plugins: ' . implode( ', ', $integrity_group['plugins'] );
-					$lines[] = 'Problem: ' . $problem;
-					$lines[] = 'Files:';
+					$lines[] = '    Plugins: ' . implode( ', ', $integrity_group['plugins'] );
+					$lines[] = '    Problem: ' . $problem;
+					$lines[] = '    Files:';
 					foreach ( $integrity_group['files'] as $location ) {
-						$lines[] = '  - ' . $location;
+						$lines[] = '      - ' . $location;
 					}
 					$lines[] = '';
 				}
@@ -6659,30 +7060,30 @@ PHP;
 			$lines[] = str_repeat( '-', self::SCAN_LOG_SEPARATOR_WIDTH );
 			foreach ( $this->group_plugin_recommendations( $recommendations ) as $recommendation_group ) {
 				$lines[] = sprintf( '[%s] %s', strtoupper( $recommendation_group['action'] ), $recommendation_group['reason'] );
-				$lines[] = '  Plugins:';
+				$lines[] = '    Plugins:';
 				foreach ( $recommendation_group['slugs'] as $slug ) {
-					$lines[] = '    - ' . $slug;
+					$lines[] = '      - ' . $slug;
 				}
 				$lines[] = '';
 			}
 			if ( ! empty( $this->inactive_plugins ) ) {
 				$lines[] = '[CLEANUP] Inactive plugins';
-				$lines[] = 'Plugins:';
+				$lines[] = '    Status: ' . ( $this->full_scan ? 'Included in the full scan.' : 'Not scanned.' );
+				$lines[] = '    Action: Remove if not needed.';
+				$lines[] = '    Plugins:';
 				foreach ( $this->inactive_code_display_list( $this->inactive_plugins ) as $plugin ) {
-					$lines[] = '  - ' . $plugin;
+					$lines[] = '      - ' . $plugin;
 				}
-				$lines[] = 'Status: ' . ( $this->full_scan ? 'Included in the full scan.' : 'Not scanned.' );
-				$lines[] = 'Action: Remove if not needed.';
 				$lines[] = '';
 			}
 			if ( ! empty( $this->inactive_themes ) ) {
 				$lines[] = '[CLEANUP] Inactive themes';
-				$lines[] = 'Themes:';
+				$lines[] = '    Status: ' . ( $this->full_scan ? 'Included in the full scan.' : 'Not scanned.' );
+				$lines[] = '    Action: Remove if not needed.';
+				$lines[] = '    Themes:';
 				foreach ( $this->inactive_code_display_list( $this->inactive_themes ) as $theme ) {
-					$lines[] = '  - ' . $theme;
+					$lines[] = '      - ' . $theme;
 				}
-				$lines[] = 'Status: ' . ( $this->full_scan ? 'Included in the full scan.' : 'Not scanned.' );
-				$lines[] = 'Action: Remove if not needed.';
 				$lines[] = '';
 			}
 		}

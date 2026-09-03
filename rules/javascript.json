@@ -1,10 +1,53 @@
 {
     "rules": [
-        {"id":"js_eval_atob","regex":"~eval\\s*\\([^;]{0,300}(?:atob|String\\.fromCharCode|unescape)\\s*\\(~is","severity":"critical","confidence":95,"description":"Obfuscated JavaScript payload executed with eval"},
-        {"id":"js_function_obfuscated","regex":"~new\\s+Function\\s*\\([^;]{0,500}(?:atob|fromCharCode|unescape)~is","severity":"high","confidence":92,"description":"Obfuscated JavaScript executed through Function constructor"},
-        {"id":"js_hidden_iframe","regex":"~<iframe[^>]+(?:display\\s*:\\s*none|visibility\\s*:\\s*hidden|width\\s*=\\s*[\\'\"]?0|height\\s*=\\s*[\\'\"]?0)~is","severity":"high","confidence":86,"description":"Hidden iframe injection"},
-        {"id":"js_redirect_obfuscated","regex":"~(?:(?:location\\.(?:href|replace)|window\\.location)\\s*(?:=|\\()[^;\\r\\n]{0,240}(?:atob|String\\.fromCharCode|unescape)\\s*\\(|(?:atob|String\\.fromCharCode|unescape)\\s*\\([^;\\r\\n]{0,240}(?:location\\.(?:href|replace)|window\\.location)\\s*(?:=|\\())~is","severity":"high","confidence":84,"description":"Decoded JavaScript payload used in a browser redirect"},
-        {"id":"js_long_hex_exec","regex":"~(?:(?:eval\\s*\\(|new\\s+Function\\s*\\(|document\\.write\\s*\\()[\\s\\S]{0,500}(?:\\\\x[0-9a-fA-F]{2}){16,}|(?:\\\\x[0-9a-fA-F]{2}){16,}[\\s\\S]{0,500}(?:eval\\s*\\(|new\\s+Function\\s*\\(|document\\.write\\s*\\())~is","severity":"high","confidence":84,"description":"Long hexadecimal JavaScript payload near dynamic execution"},
-        {"id":"js_long_unicode_exec","regex":"~(?:(?:eval\\s*\\(|new\\s+Function\\s*\\(|document\\.write\\s*\\()[\\s\\S]{0,500}(?:\\\\u[0-9a-fA-F]{4}){12,}|(?:\\\\u[0-9a-fA-F]{4}){12,}[\\s\\S]{0,500}(?:eval\\s*\\(|new\\s+Function\\s*\\(|document\\.write\\s*\\())~is","severity":"high","confidence":84,"description":"Long Unicode-escaped JavaScript payload near dynamic execution"}
+        {
+            "id": "js_eval_atob",
+            "regex": "~eval\\s*\\([^;]{0,300}(?:atob|String\\.fromCharCode|unescape)\\s*\\(~is",
+            "severity": "critical",
+            "confidence": 95,
+            "description": "Obfuscated JavaScript payload executed with eval"
+        },
+        {
+            "id": "js_function_obfuscated",
+            "regex": "~new\\s+Function\\s*\\([^;]{0,500}(?:atob|fromCharCode|unescape)~is",
+            "severity": "high",
+            "confidence": 92,
+            "description": "Obfuscated JavaScript executed through Function constructor"
+        },
+        {
+            "id": "js_hidden_iframe",
+            "regex": "~<iframe[^>]+(?:display\\s*:\\s*none|visibility\\s*:\\s*hidden|width\\s*=\\s*[\\'\"]?0|height\\s*=\\s*[\\'\"]?0)~is",
+            "severity": "high",
+            "confidence": 86,
+            "description": "Hidden iframe injection"
+        },
+        {
+            "id": "js_redirect_obfuscated",
+            "regex": "~(?:(?:location\\.(?:href|replace)|window\\.location)\\s*(?:=|\\()[^;\\r\\n]{0,240}(?:atob|String\\.fromCharCode|unescape)\\s*\\(|(?:atob|String\\.fromCharCode|unescape)\\s*\\([^;\\r\\n]{0,240}(?:location\\.(?:href|replace)|window\\.location)\\s*(?:=|\\())~is",
+            "severity": "high",
+            "confidence": 84,
+            "description": "Decoded JavaScript payload used in a browser redirect"
+        },
+        {
+            "id": "js_long_hex_exec",
+            "regex": "~(?:(?:eval\\s*\\(|new\\s+Function\\s*\\(|document\\.write\\s*\\()[\\s\\S]{0,500}(?:\\\\x[0-9a-fA-F]{2}){16,}|(?:\\\\x[0-9a-fA-F]{2}){16,}[\\s\\S]{0,500}(?:eval\\s*\\(|new\\s+Function\\s*\\(|document\\.write\\s*\\())~is",
+            "severity": "high",
+            "confidence": 84,
+            "description": "Long hexadecimal JavaScript payload near dynamic execution"
+        },
+        {
+            "id": "js_long_unicode_exec",
+            "regex": "~(?:(?:eval\\s*\\(|new\\s+Function\\s*\\(|document\\.write\\s*\\()[\\s\\S]{0,500}(?:\\\\u[0-9a-fA-F]{4}){12,}|(?:\\\\u[0-9a-fA-F]{4}){12,}[\\s\\S]{0,500}(?:eval\\s*\\(|new\\s+Function\\s*\\(|document\\.write\\s*\\())~is",
+            "severity": "high",
+            "confidence": 84,
+            "description": "Long Unicode-escaped JavaScript payload near dynamic execution"
+        },
+        {
+            "id": "js_clickfix_clipboard_command",
+            "regex": "~(?:(?:navigator\\.clipboard\\.writeText\\s*\\(|document\\.execCommand\\s*\\(\\s*['\\\"]copy['\\\"])[\\s\\S]{0,1800}(?:powershell(?:\\.exe)?[\\s\\S]{0,800}(?:-e(?:nc|ncodedcommand)?\\b|\\biwr\\b|invoke-webrequest|invoke-restmethod|\\biex\\b|downloadstring)|cmd\\.exe[\\s\\S]{0,800}powershell)|(?:powershell(?:\\.exe)?[\\s\\S]{0,800}(?:-e(?:nc|ncodedcommand)?\\b|\\biwr\\b|invoke-webrequest|invoke-restmethod|\\biex\\b|downloadstring)|cmd\\.exe[\\s\\S]{0,800}powershell)[\\s\\S]{0,1800}(?:navigator\\.clipboard\\.writeText\\s*\\(|document\\.execCommand\\s*\\(\\s*['\\\"]copy['\\\"]))~is",
+            "severity": "high",
+            "confidence": 96,
+            "description": "JavaScript copies a download/execute system command to the visitor clipboard"
+        }
     ]
 }

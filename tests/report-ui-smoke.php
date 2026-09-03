@@ -16,6 +16,12 @@ class WP_CLI {
 
 require dirname( __DIR__ ) . '/src/SecurityScanCommand.php';
 
+$command_source = file_get_contents( dirname( __DIR__ ) . '/src/SecurityScanCommand.php' );
+if ( false !== strpos( $command_source, '$reportable_findings = $this->filter_findings_for_plugin_integrity' ) || false === strpos( $command_source, 'Security Scan — finalizing report...' ) || false === strpos( $command_source, 'prepare_finalization_guard' ) ) {
+	fwrite( STDERR, "Report finalization must avoid the old duplicate finding array and retain the finalization diagnostics.\n" );
+	exit( 1 );
+}
+
 $command = new Security_Scan_Command();
 
 $version = new ReflectionMethod( $command, 'version' );

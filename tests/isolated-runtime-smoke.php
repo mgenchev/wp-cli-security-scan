@@ -37,7 +37,70 @@ foreach ( $forbidden_patterns as $pattern ) {
 	}
 }
 
+$config_constants = [
+	'ABSPATH',
+	'WP_CONTENT_DIR',
+	'WP_PLUGIN_DIR',
+	'WPMU_PLUGIN_DIR',
+	'DB_NAME',
+	'DB_USER',
+	'DB_PASSWORD',
+	'DB_HOST',
+	'DB_CHARSET',
+	'MYSQL_CLIENT_FLAGS',
+	'CUSTOM_USER_TABLE',
+	'CUSTOM_USER_META_TABLE',
+	'BLOG_ID_CURRENT_SITE',
+	'BLOGID_CURRENT_SITE',
+	'SITE_ID_CURRENT_SITE',
+	'PRIMARY_NETWORK_ID',
+	'MULTISITE',
+	'WP_HOME',
+	'WP_SITEURL',
+	'WPLANG',
+	'UPLOADS',
+	'BLOGUPLOADDIR',
+	'WP_HTTP_BLOCK_EXTERNAL',
+	'WP_ACCESSIBLE_HOSTS',
+	'WP_PROXY_HOST',
+	'WP_PROXY_PORT',
+	'WP_PROXY_BYPASS_HOSTS',
+	'WP_PROXY_USERNAME',
+	'WP_PROXY_PASSWORD',
+];
+foreach ( token_get_all( $source ) as $token ) {
+	if ( is_array( $token ) && T_STRING === $token[0] && in_array( $token[1], $config_constants, true ) ) {
+		fwrite( STDERR, "Isolated scanner runtime must access WordPress config constants through defined()/constant(), not bare constant tokens: {$token[1]}\n" );
+		exit( 1 );
+	}
+}
+
 $command = new Security_Scan_Command();
+
+// The isolated runtime should provide the standard content path constants that
+// wp-settings.php would normally define, without loading WordPress itself.
+$content_dir_property = new ReflectionProperty( $command, 'content_dir' );
+$content_dir_property->setAccessible( true );
+$content_dir_property->setValue( $command, '/tmp/security-scan-wp-content' );
+$plugin_dir_property = new ReflectionProperty( $command, 'plugin_dir' );
+$plugin_dir_property->setAccessible( true );
+$plugin_dir_property->setValue( $command, '/tmp/security-scan-wp-content/plugins' );
+$mu_plugin_dir_property = new ReflectionProperty( $command, 'mu_plugin_dir' );
+$mu_plugin_dir_property->setAccessible( true );
+$mu_plugin_dir_property->setValue( $command, '/tmp/security-scan-wp-content/mu-plugins' );
+$define_paths = new ReflectionMethod( $command, 'define_isolated_path_constants' );
+$define_paths->setAccessible( true );
+$define_paths->invoke( $command );
+if (
+    ! defined( 'WP_CONTENT_DIR' ) || '/tmp/security-scan-wp-content' !== constant( 'WP_CONTENT_DIR' )
+    || ! defined( 'WP_PLUGIN_DIR' ) || '/tmp/security-scan-wp-content/plugins' !== constant( 'WP_PLUGIN_DIR' )
+    || ! defined( 'WPMU_PLUGIN_DIR' ) || '/tmp/security-scan-wp-content/mu-plugins' !== constant( 'WPMU_PLUGIN_DIR' )
+) {
+    fwrite( STDERR, "Isolated runtime should define standard content path constants from resolved scanner paths.
+" );
+    exit( 1 );
+}
+
 $decode = new ReflectionMethod( $command, 'decode_stored_value' );
 $decode->setAccessible( true );
 

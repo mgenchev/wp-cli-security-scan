@@ -189,6 +189,153 @@ $process->exec( $_POST['value'] );
 CODE,
 		'expect_none' => true,
 	],
+
+	[
+		'name' => 'ReflectionFunction decoded command target with request payload',
+		'code' => <<<'CODE'
+<?php
+$runner = new ReflectionFunction( convert_uudecode( "&<WES=&5M`" ) );
+$runner->invoke( $_POST['command'] );
+CODE,
+		'expect' => 'dataflow_reflection_command',
+	],
+	[
+		'name' => 'benign ReflectionFunction invocation stays clean',
+		'code' => <<<'CODE'
+<?php
+$runner = new ReflectionFunction( 'strlen' );
+$length = $runner->invoke( 'hello' );
+CODE,
+		'expect_none' => true,
+	],
+	[
+		'name' => 'Doctrine-style resource assertion does not propagate stream payload state',
+		'code' => <<<'CODE'
+<?php
+function convert_binary_value( $value ) {
+	if ( is_string( $value ) ) {
+		$fp = fopen( 'php://temp', 'rb+' );
+		assert( is_resource( $fp ) );
+		fwrite( $fp, $value );
+		$value = $fp;
+	}
+	return $value;
+}
+CODE,
+		'expect_none' => true,
+	],
+	[
+		'name' => 'unrelated request data near an array callable is not treated as data flow',
+		'code' => <<<'CODE'
+<?php
+$notice = $_COOKIE['notice'];
+$callbacks = [ 'render' => 'render_notice' ];
+$value = sanitize_text_field( $notice );
+$callbacks['render']( $value );
+CODE,
+		'expect_none' => true,
+	],
+
+	[
+		'name' => 'array_filter closure taint does not contaminate returned callback configuration',
+		'code' => <<<'CODE'
+<?php
+function render_acf_style_callback( $request_tax ) {
+	$taxonomies = get_registered_taxonomies();
+	$matches = array_filter(
+		$taxonomies,
+		function ( $taxonomy ) use ( $request_tax ) {
+			return $taxonomy['taxonomy'] === $request_tax['taxonomy'];
+		}
+	);
+	$config = array_shift( $matches );
+	$callback = $config['meta_box_cb'];
+	if ( is_callable( $callback ) ) {
+		call_user_func( $callback, $request_tax );
+	}
+}
+render_acf_style_callback( $_POST['taxonomy'] );
+CODE,
+		'expect_none' => true,
+	],
+	[
+		'name' => 'captured request value does not make an anonymous filter callback request-controlled',
+		'code' => <<<'CODE'
+<?php
+function security_scan_test_collection() {
+	$type = $_GET['type'];
+
+	$items = array(
+		array( 'type' => 'one', 'callback' => 'trim' ),
+		array( 'type' => 'two', 'callback' => 'strtolower' ),
+	);
+
+	$items = array_filter(
+		$items,
+		function( $item ) use ( $type ) {
+			return $item['type'] === $type;
+		}
+	);
+
+	foreach ( $items as $item ) {
+		call_user_func( $item['callback'], 'HELLO' );
+	}
+}
+CODE,
+		'expect_none' => true,
+	],
+	[
+		'name' => 'request-controlled callback value remains reportable next to a safe closure',
+		'code' => <<<'CODE'
+<?php
+$type = $_GET['type'];
+$items = array_filter( [ 'one', 'two' ], function( $item ) use ( $type ) {
+	return $item === $type;
+} );
+$callback = $_GET['callback'];
+call_user_func( $callback, 'HELLO' );
+CODE,
+		'expect' => 'dataflow_tainted_callback_sink',
+	],
+
+	[
+		'name' => 'tainted collection data remains tainted through array_filter',
+		'code' => <<<'CODE'
+<?php
+$callbacks = array_filter( $_GET['callbacks'] );
+call_user_func( $callbacks[0] );
+CODE,
+		'expect' => 'dataflow_tainted_callback_sink',
+	],
+	[
+		'name' => 'local existence check alone does not suppress request-controlled include',
+		'code' => <<<'CODE'
+<?php
+$file = dirname( __FILE__ ) . '/page-' . $_GET['page'] . '.php';
+if ( is_file( $file ) ) {
+	require_once $file;
+}
+CODE,
+		'expect' => 'dataflow_include_taint',
+	],
+	[
+		'name' => 'anchored include without existence check remains critical',
+		'code' => <<<'CODE'
+<?php
+$file = __DIR__ . '/page-' . $_GET['page'] . '.php';
+require $file;
+CODE,
+		'expect' => 'dataflow_include_taint',
+	],
+	[
+		'name' => 'local file read copied to PHP file is not remote payload execution',
+		'code' => <<<'CODE'
+<?php
+$template = file_get_contents( __DIR__ . '/template.txt' );
+file_put_contents( __DIR__ . '/cache.php', $template );
+CODE,
+		'expect_none' => true,
+	],
 ];
 
 $failures = 0;
@@ -199,6 +346,9 @@ foreach ( $tests as $test ) {
 	$findings = $analyzer->analyze( $code );
 	$rules = array_column( $findings, 'rule' );
 	$passed = ! empty( $test['expect_none'] ) ? empty( $findings ) : in_array( $test['expect'], $rules, true );
+	if ( $passed && ! empty( $test['expect_absent'] ) && in_array( $test['expect_absent'], $rules, true ) ) {
+		$passed = false;
+	}
 
 	if ( $passed ) {
 		echo 'PASS  ' . $test['name'] . PHP_EOL;

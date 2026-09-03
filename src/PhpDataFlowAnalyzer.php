@@ -78,6 +78,76 @@ class Security_Scan_Php_Data_Flow_Analyzer {
 		'apache_request_headers',
 	];
 
+
+	/**
+	 * WordPress URL builders whose result is provably local to the current site/network.
+	 *
+	 * Sensitive data sent back to one of these URLs is not external exfiltration.
+	 * The hint is only trusted while the target remains non-tainted and contains no
+	 * independently observed remote URL evidence.
+	 */
+	private const LOCAL_URL_FUNCTIONS = [
+		'admin_url',
+		'home_url',
+		'site_url',
+		'network_admin_url',
+		'network_home_url',
+		'network_site_url',
+		'rest_url',
+		'self_admin_url',
+		'user_admin_url',
+		'content_url',
+		'includes_url',
+		'plugins_url',
+		'wp_login_url',
+		'wp_logout_url',
+	];
+
+	/**
+	 * Functions whose result is a boolean type/property check rather than the
+	 * underlying payload. Their arguments may be tainted/remote, but the return
+	 * value itself cannot carry executable content.
+	 */
+	private const BOOLEAN_PREDICATE_FUNCTIONS = [
+		'is_array',
+		'is_bool',
+		'is_callable',
+		'is_double',
+		'is_float',
+		'is_int',
+		'is_integer',
+		'is_iterable',
+		'is_long',
+		'is_null',
+		'is_numeric',
+		'is_object',
+		'is_real',
+		'is_resource',
+		'is_scalar',
+		'is_string',
+	];
+
+	/**
+	 * Collection helpers whose return value derives from data arguments rather
+	 * than from the callback/control argument itself. Modeling these explicitly
+	 * prevents callback/closure taint from contaminating the returned collection.
+	 */
+	private const FIRST_ARGUMENT_VALUE_FUNCTIONS = [
+		'array_filter',
+		'array_values',
+		'array_unique',
+		'array_reverse',
+		'array_slice',
+		'array_chunk',
+		'array_column',
+		'array_shift',
+		'array_pop',
+		'current',
+		'reset',
+		'end',
+	];
+
+
 	private const OUTBOUND_HTTP_SINKS = [
 		'wp_remote_get',
 		'wp_remote_post',
@@ -288,6 +358,15 @@ class Security_Scan_Php_Data_Flow_Analyzer {
 				continue;
 			}
 
+			if ( T_VARIABLE === $token['id'] ) {
+				$method_call = $this->parse_object_method_call_at( $tokens, $i );
+				if ( null !== $method_call ) {
+					$this->evaluate_object_method_call( $method_call );
+					$i = max( $i, $method_call['end'] );
+					continue;
+				}
+			}
+
 			$call = $this->parse_callable_at( $tokens, $i );
 			if ( null !== $call ) {
 				$this->evaluate_call( $call['callback'], $call['args'], $call['line'] );
@@ -381,6 +460,17 @@ class Security_Scan_Php_Data_Flow_Analyzer {
 
 		$first = $tokens[0];
 
+		// Anonymous and arrow functions have a statically defined callback identity.
+		// Captured request-derived values belong to the closure payload/body state,
+		// not to the identity of the callback itself. Treating captures as callback
+		// taint causes false positives for normal filtering/configuration closures.
+		$is_arrow_function = defined( 'T_FN' ) && constant( 'T_FN' ) === $first['id'];
+		if ( T_FUNCTION === $first['id'] || $is_arrow_function ) {
+			$state = $this->empty_state();
+			$state['transport'] = 'closure';
+			return $state;
+		}
+
 		if ( T_EVAL === $first['id'] ) {
 			$call = $this->parse_parenthesized_call_after( $tokens, 0 );
 			if ( null !== $call ) {
@@ -390,12 +480,20 @@ class Security_Scan_Php_Data_Flow_Analyzer {
 			return $this->empty_state();
 		}
 
+
 		if ( T_CONSTANT_ENCAPSED_STRING === $first['id'] && 1 === count( $tokens ) ) {
 			return $this->literal_state( $this->decode_php_string_literal( $first['text'] ) );
 		}
 
 		if ( in_array( $first['id'], [ T_LNUMBER, T_DNUMBER ], true ) && 1 === count( $tokens ) ) {
 			return $this->literal_state( $first['text'] );
+		}
+
+		if ( T_NEW === $first['id'] ) {
+			$reflection = $this->evaluate_reflection_constructor( $tokens, $depth );
+			if ( null !== $reflection ) {
+				return $reflection;
+			}
 		}
 
 		if ( T_VARIABLE === $first['id'] ) {
@@ -433,6 +531,108 @@ class Security_Scan_Php_Data_Flow_Analyzer {
 		}
 
 		return $state;
+	}
+
+	/**
+	 * Model ReflectionFunction targets without executing reflected code.
+	 */
+	private function evaluate_reflection_constructor( array $tokens, $depth ) {
+		$class_index = $this->next_significant_index( $tokens, 1 );
+		if ( null === $class_index ) {
+			return null;
+		}
+
+		$class_name = strtolower( trim( $tokens[ $class_index ]['text'], "\\" ) );
+		if ( 'reflectionfunction' !== $class_name ) {
+			return null;
+		}
+
+		$call = $this->parse_parenthesized_call_after( $tokens, $class_index );
+		if ( null === $call ) {
+			return null;
+		}
+
+		$target = isset( $call['args'][0] )
+			? $this->evaluate_expression( $call['args'][0], $depth + 1 )
+			: $this->empty_state();
+		$target['transport'] = 'reflection_function';
+		return $target;
+	}
+
+	/**
+	 * Parse $object->method(...) for reflection invocation handling.
+	 */
+	private function parse_object_method_call_at( array $tokens, $index ) {
+		$object = $this->parse_variable_reference( $tokens, $index );
+		if ( null === $object ) {
+			return null;
+		}
+
+		$operator = $this->next_significant_index( $tokens, $object['end'] + 1 );
+		if ( null === $operator || ( T_OBJECT_OPERATOR !== $tokens[ $operator ]['id'] && '->' !== $tokens[ $operator ]['text'] ) ) {
+			return null;
+		}
+
+		$method_index = $this->next_significant_index( $tokens, $operator + 1 );
+		if ( null === $method_index || T_STRING !== $tokens[ $method_index ]['id'] ) {
+			return null;
+		}
+
+		$method = strtolower( $tokens[ $method_index ]['text'] );
+		if ( ! in_array( $method, [ 'invoke', 'invokeargs' ], true ) ) {
+			return null;
+		}
+
+		$call = $this->parse_parenthesized_call_after( $tokens, $method_index );
+		if ( null === $call ) {
+			return null;
+		}
+
+		return [
+			'object' => $object['key'],
+			'method' => $method,
+			'args'   => $call['args'],
+			'line'   => $tokens[ $method_index ]['line'],
+			'end'    => $call['end'],
+		];
+	}
+
+	/**
+	 * Detect ReflectionFunction invocation of dangerous/dynamic targets.
+	 */
+	private function evaluate_object_method_call( array $call ) {
+		$object = $this->get_variable_state( $call['object'] );
+		if ( 'reflection_function' !== $object['transport'] ) {
+			return;
+		}
+
+		$args = [];
+		foreach ( $call['args'] as $arg_tokens ) {
+			$args[] = $this->evaluate_expression( $arg_tokens, 1 );
+		}
+		$payload = $this->merge_argument_states( $args );
+		$target = null !== $object['literal'] ? strtolower( trim( $object['literal'], "\\" ) ) : null;
+		$line = $this->absolute_line( $call['line'] );
+
+		if ( null !== $target && in_array( $target, self::COMMAND_SINKS, true ) ) {
+			if ( $payload['tainted'] || $payload['decoded'] || $payload['remote'] ) {
+				$this->add_finding( 'critical', 99, 'dataflow_reflection_command', 'Untrusted data reaches OS command execution through ReflectionFunction', $line, true, $payload['sources'] );
+			} elseif ( $object['decoded'] ) {
+				$this->add_finding( 'high', 95, 'dataflow_reflection_command_target', 'Obfuscated ReflectionFunction target resolves to an OS command primitive', $line, true );
+			}
+			return;
+		}
+
+		if ( null !== $target && in_array( $target, self::CODE_SINKS, true ) ) {
+			if ( $payload['tainted'] || $payload['decoded'] || $payload['remote'] ) {
+				$this->add_finding( 'critical', 99, 'dataflow_reflection_code', 'Untrusted data reaches dynamic PHP execution through ReflectionFunction', $line, true, $payload['sources'] );
+			}
+			return;
+		}
+
+		if ( ( $object['tainted'] || $object['decoded'] ) && ( $payload['tainted'] || $payload['decoded'] || $payload['remote'] ) ) {
+			$this->add_finding( 'critical', 98, 'dataflow_reflection_dynamic', 'Obfuscated or request-controlled ReflectionFunction target is invoked with untrusted data', $line, true, $payload['sources'] );
+		}
 	}
 
 	private function parse_callable_at( array $tokens, $index ) {
@@ -654,6 +854,30 @@ class Security_Scan_Php_Data_Flow_Analyzer {
 			}
 		}
 
+
+		if ( in_array( $name, self::LOCAL_URL_FUNCTIONS, true ) ) {
+			$state = $this->merge_argument_states( $args );
+			$state['local_url_hint'] = true;
+			$state['remote_url_hint'] = false;
+			$state['remote'] = false;
+			return $state;
+		}
+
+		// Collection callbacks control filtering/transformation but are not data
+		// returned by helpers such as array_filter(). Do not merge callback taint
+		// into the collection result.
+		if ( in_array( $name, self::FIRST_ARGUMENT_VALUE_FUNCTIONS, true ) ) {
+			return isset( $args[0] ) ? $args[0] : $this->empty_state();
+		}
+
+		if ( 'array_map' === $name ) {
+			return $this->merge_argument_states( array_slice( $args, 1 ) );
+		}
+
+		if ( in_array( $name, self::BOOLEAN_PREDICATE_FUNCTIONS, true ) ) {
+			return $this->empty_state();
+		}
+
 		if ( in_array( $name, self::REQUEST_SOURCE_FUNCTIONS, true ) ) {
 			if ( 'filter_input' === $name ) {
 				$field = isset( $args[1] ) && null !== $args[1]['literal'] ? (string) $args[1]['literal'] : '*';
@@ -664,18 +888,26 @@ class Security_Scan_Php_Data_Flow_Analyzer {
 
 		if ( in_array( $name, self::REMOTE_SOURCES, true ) ) {
 			$state = $this->merge_argument_states( $args );
-			if ( in_array( $name, [ 'file_get_contents', 'fopen' ], true ) && isset( $args[0] ) && $args[0]['remote_url_hint'] ) {
-				$this->report_outbound_sink( 'HTTP', $args[0], $args[0], $line, 'dataflow_sensitive_url_exfil' );
-			}
-			$state['remote'] = true;
 			if ( 'file_get_contents' === $name || 'fopen' === $name ) {
 				$first = isset( $args[0] ) ? $args[0] : $this->empty_state();
 				if ( null !== $first['literal'] && 0 === stripos( $first['literal'], 'php://input' ) ) {
 					$state['tainted'] = true;
 					$state['sources']['php://input'] = true;
 					$state['remote'] = false;
+					return $state;
 				}
+
+				// Local streams/files are not remote content. A literal/constructed URL
+				// is marked remote, while a request-controlled dynamic target remains
+				// tainted through the merged argument state.
+				if ( $first['remote_url_hint'] ) {
+					$this->report_outbound_sink( 'HTTP', $first, $first, $line, 'dataflow_sensitive_url_exfil' );
+					$state['remote'] = true;
+				}
+				return $state;
 			}
+
+			$state['remote'] = true;
 			return $state;
 		}
 
@@ -817,7 +1049,23 @@ class Security_Scan_Php_Data_Flow_Analyzer {
 		$this->set_variable_state( $ref['key'], $state );
 	}
 
+
+
 	private function report_outbound_sink( $transport, array $payload, array $target, $line, $rule ) {
+		// A proven WordPress self/local URL is not outbound exfiltration. Keep the
+		// suppression deliberately narrow: if the target is request-controlled,
+		// remotely sourced, or contains independent remote-URL evidence, the finding
+		// remains reportable.
+		if (
+			'HTTP' === $transport
+			&& ! empty( $target['local_url_hint'] )
+			&& empty( $target['tainted'] )
+			&& empty( $target['remote'] )
+			&& empty( $target['remote_url_hint'] )
+		) {
+			return;
+		}
+
 		$summary_param = $this->has_summary_parameter_source( $payload );
 		if ( ! $payload['sensitive'] && ! $summary_param ) {
 			return;
@@ -968,10 +1216,6 @@ class Security_Scan_Php_Data_Flow_Analyzer {
 			$this->add_finding( 'high', 90, 'dataflow_whitespace_steganography', 'Whitespace-to-binary decoding pattern commonly used to conceal PHP payloads', $line, true );
 		}
 
-		if ( ! isset( $this->seen['dataflow_tainted_dynamic_callback'] ) && 1 === preg_match( '~(?:\$_COOKIE|\$_REQUEST|\$_POST|\$_GET)[\s\S]{0,1800}(?:\[[^\]]+\]\s*\()~i', $source, $matches, PREG_OFFSET_CAPTURE ) ) {
-			$line = $this->absolute_line( 1 + substr_count( substr( $source, 0, $matches[0][1] ), "\n" ) );
-			$this->add_finding( 'high', 91, 'dataflow_superglobal_array_callback', 'Request/cookie data is used through an array element as a dynamic callable', $line, true );
-		}
 	}
 
 	/**
@@ -1234,6 +1478,7 @@ class Security_Scan_Php_Data_Flow_Analyzer {
 			'decoded'      => false,
 			'remote'       => false,
 			'remote_url_hint' => false,
+			'local_url_hint'  => false,
 			'php_path_hint'=> false,
 			'transport'    => null,
 			'sources'      => [],
@@ -1268,6 +1513,7 @@ class Security_Scan_Php_Data_Flow_Analyzer {
 		$state['decoded'] = $left['decoded'] || $right['decoded'];
 		$state['remote'] = $left['remote'] || $right['remote'];
 		$state['remote_url_hint'] = $left['remote_url_hint'] || $right['remote_url_hint'];
+		$state['local_url_hint'] = $left['local_url_hint'] || $right['local_url_hint'];
 		$state['php_path_hint'] = $left['php_path_hint'] || $right['php_path_hint'];
 		$state['transport'] = null !== $left['transport'] ? $left['transport'] : $right['transport'];
 		$state['sources'] = $left['sources'] + $right['sources'];

@@ -1,9 +1,22 @@
 # Changelog
 
 ## [1.1.0] - 2026-09-03
+- Excluded the exact scanner-owned `security-scan.log` path from filesystem scan scope so previous scan evidence cannot be re-detected as malware on the next run; same-named logs elsewhere remain in scope.
+
+- Fixed a semantic false positive where request-derived values captured by an anonymous/arrow function could incorrectly taint the callback identity itself. Closure identity is now treated as statically defined, while genuinely request-controlled callback values remain reportable.
+
+- Added end-to-end file-routing regression coverage for uploads executable detection and ClickFix JavaScript detection.
+
+- Harden isolated finalization compatibility by defining missing standard WordPress content path constants from already-resolved scanner paths after `wp-config.php` evaluation; finalization errors now include source file and line diagnostics.
+
+- Hardened isolated configuration access so WordPress config constants are read through `defined()` / `constant()` only, preventing undefined-constant failures when optional path/runtime constants are absent.
 
 ### Added
 
+- Added semantic detection for `ReflectionFunction` command/code execution backdoors, including obfuscated reflected function names invoked with request-controlled payloads.
+- Added direct JavaScript credential/payment skimmer detection that requires a sensitive browser source, a real network sink, and a literal external HTTP(S) target; local/self AJAX and ordinary analytics/form values remain excluded.
+- Added ClickFix/fake-verification JavaScript detection for clipboard-copy behavior combined with PowerShell/`cmd.exe` download-and-execute command markers.
+- Added context-aware detection for exact `wp_options` persistence keys used by documented campaigns (`_hdra_core`, `_pre_user_id`, and `API_SN_CLOUDSERVER`) without treating those strings as generic source-code IOCs.
 - Added opt-in `--deep-database` mode to the main and `database` commands. It discovers current-site custom tables, excludes WordPress core/global and other multisite-blog tables, and scans text-like columns with the existing IOC/database/JavaScript rules.
 - Deep custom-table scans use numeric-primary-key keyset pagination when possible and bounded `LIMIT/OFFSET` fallback for unconventional schemas.
 - Added PHP semantic outbound-transfer detection for sensitive request/session data reaching WordPress HTTP calls, cURL, mail, remote URL reads, and socket writes. The layer tracks credential/session/payment-like sources through assignments and local helper functions without treating ordinary form/webhook forwarding as suspicious by itself.
@@ -13,8 +26,8 @@
 
 ### Changed
 
-- Scan-log timestamps now use the site-local WordPress timezone (`timezone_string`, with `gmt_offset` fallback) while the normalized report timestamp remains UTC for machine-readable output.
-- Inactive plugin/theme CLEANUP recommendations in `security-scan.log` now list each affected plugin/theme by name and slug, plus concise scan status and removal guidance.
+- Scan-log timestamps now use the local machine/CLI timezone when it can be resolved safely, with UTC fallback; WordPress site timezone settings no longer affect the log header.
+- Inactive plugin/theme CLEANUP recommendations in `security-scan.log` now show status and action before the affected plugin/theme list, with each item identified by name and slug.
 - Simplified the scan-log header to a single timestamped `WORDPRESS SECURITY SCAN:` line followed by a 68-character ASCII separator.
 - Reformatted plugin integrity log entries as explicit `[CRITICAL] Plugin integrity changes` blocks with separate `Plugins`, `Problem`, and `Files` fields.
 - Reformatted structured Users & persistence findings into aligned plain-text columns for account, direct-capability, and application-password details while keeping cron/Action Scheduler locations in the standard layout.
@@ -24,11 +37,20 @@
 - Grouped Recommendations by action and user-facing reason so plugins with the same remediation are listed under one concise recommendation in scan logs, Markdown, and detailed terminal renderers.
 - Added a checksum-verified plugin fast path: verified WordPress.org plugins skip static/semantic/density analysis that would be suppressed anyway and retain only executable-file exact `CRITICAL` IOC coverage at 97%+ confidence, matching the existing reportability policy.
 - Removed the unused suspicious-file modification-time clustering pass; cross-layer IOC correlation now provides explicit report context instead of computing unrendered timestamp buckets.
+- Reduced false positives in the PHP analyzer without weakening proven data-flow detection: boolean type predicates no longer propagate payload state into `assert()`, local `file_get_contents()`/`fopen()` reads are no longer treated as remote content without URL evidence, the broad proximity-only request/array-callable fallback was removed, and density heuristics no longer treat generic `call_user_func()`, `assert()`, or `str_repeat()` usage as malware execution/obfuscation signals by themselves.
+- Suppressed the generic executable-in-uploads finding for tiny PHP guard files that contain only comments/whitespace and an optional `exit`/`die`, while retaining normal IOC/semantic/content scanning for those files.
+- Added confirmation-oriented false-positive controls for real plugin patterns without vendor/path whitelists: collection helpers such as `array_filter()` no longer propagate callback/control taint into returned data, sensitive WordPress HTTP traffic to a provably local/self URL is not treated as external exfiltration, and density findings require execution/obfuscation/request primitives to occur in one bounded neighborhood rather than merely somewhere in the same large file. Request-controlled includes remain unchanged because local anchoring plus `is_file()` alone does not prove traversal is impossible.
+- Reduced end-of-scan memory pressure by applying plugin-integrity trust and `--min-severity` filtering in one pass before releasing the raw finding list. Interactive scans now show a `finalizing report` spinner, and a small shutdown memory reserve surfaces otherwise-hidden PHP fatal/memory-limit errors during report generation when possible.
+- Standardized scan-log recommendation indentation so Plugin integrity, REINSTALL/REVIEW, and CLEANUP child fields use the same nested layout as detailed findings.
 
 ### Tests
 
 - Added regression coverage for verified-plugin fast-path equivalence, grouped recommendation rendering, current-site custom-table deep database discovery/scanning, sensitive outbound data-flow with false-positive controls for ordinary webhook/contact traffic, upload container signature/boundary validation, expanded persistence checks, Action Scheduler scanning, and cross-layer IOC correlation.
-- Expanded report/DB regression coverage for the timestamped log header, critical plugin-integrity `Plugins/Problem/Files` layout, aligned Users & persistence columns, and cached table-column metadata.
+- Expanded report/DB regression coverage for the machine-local timestamped log header, critical plugin-integrity `Plugins/Problem/Files` layout, aligned Users & persistence columns, cleanup field ordering, cached table-column metadata, Doctrine-style resource assertions, local stream reads, callback proximity false positives, and density-heuristic controls.
+- Added regression coverage for ACF-style collection callbacks, preservation of request-controlled includes despite local existence checks, Gravity Forms-style sensitive-cookie self-requests to `admin-ajax.php`, external sensitive HTTP controls, and one-pass report-finalization behavior.
+- Added an explicit false-positive hardening security-boundary suite that pairs suppressed benign patterns with dangerous equivalents, ensuring request-controlled callbacks/includes, external credential transfers, tainted dynamic reads, direct tainted `assert()`, and compact malware-density clusters remain reportable.
+- Added regression coverage for ReflectionFunction-based RCE, unobfuscated JavaScript credential/payment transfers to external endpoints, same-site/ordinary-JS false-positive controls, and ClickFix clipboard-command behavior.
+- Added context-aware database regression coverage for exact known persistence option names and near-match false-positive controls.
 
 ## [1.0.0] - 2026-09-02
 
