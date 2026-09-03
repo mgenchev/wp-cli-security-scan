@@ -3,6 +3,12 @@
 define( 'WP_CLI', true );
 define( 'ABSPATH', __DIR__ . DIRECTORY_SEPARATOR . 'tmp-root' . DIRECTORY_SEPARATOR );
 
+class Fake_Scan_Log_Database {
+	private $options;
+	public function __construct( array $options ) { $this->options = $options; }
+	public function get_option_raw( $name ) { return array_key_exists( $name, $this->options ) ? (string) $this->options[ $name ] : null; }
+}
+
 class WP_CLI {
 	public static $logs = [];
 	public static function add_command( $name, $class ) {}
@@ -14,6 +20,9 @@ class WP_CLI {
 require dirname( __DIR__ ) . '/src/SecurityScanCommand.php';
 @mkdir( ABSPATH, 0777, true );
 $command = new Security_Scan_Command();
+$database = new ReflectionProperty( $command, 'database' );
+$database->setAccessible( true );
+$database->setValue( $command, new Fake_Scan_Log_Database( [ 'timezone_string' => 'Europe/Sofia' ] ) );
 $launch_directory = new ReflectionProperty( $command, 'launch_directory' );
 $launch_directory->setAccessible( true );
 $launch_directory->setValue( $command, rtrim( ABSPATH, DIRECTORY_SEPARATOR ) );
@@ -28,6 +37,19 @@ $integrity->setValue( $command, [
 	],
 	],
 ] );
+
+$inactive_plugins = new ReflectionProperty( $command, 'inactive_plugins' );
+$inactive_plugins->setAccessible( true );
+$inactive_plugins->setValue( $command, [
+	[ 'slug' => 'hello-dolly', 'name' => 'Hello Dolly', 'file' => 'hello-dolly/hello.php' ],
+	[ 'slug' => 'akismet', 'name' => 'Akismet Anti-spam', 'file' => 'akismet/akismet.php' ],
+] );
+$inactive_themes = new ReflectionProperty( $command, 'inactive_themes' );
+$inactive_themes->setAccessible( true );
+$inactive_themes->setValue( $command, [
+	[ 'slug' => 'twentytwentyfour', 'name' => 'Twenty Twenty-Four' ],
+] );
+
 
 $uploads = [
 	[ 'section'=>'Uploads','severity'=>'high','confidence'=>96,'description'=>'Executable/script file found inside uploads','location'=>'uploads/a/index.php','line'=>null,'rule'=>'upload_exec' ],
@@ -92,10 +114,20 @@ $database = [
 	[ 'section'=>'Database','severity'=>'high','confidence'=>90,'description'=>'Shared database problem','location'=>'wp_options #2 · option_value','line'=>null,'rule'=>'db_b' ],
 ];
 $report = [
-	'scanned_at'=>gmdate('c'),'duration_seconds'=>1.2,
+	'scanned_at'=>'2026-09-03T06:53:36+00:00','duration_seconds'=>1.2,
 	'severity'=>['critical'=>4,'high'=>17,'medium'=>0,'low'=>0],
 	'files_scanned'=>20,'database_rows'=>2,'administrator_users'=>1,'total_findings'=>21,
 	'stages'=>['Core checksums'=>['findings'=>3],'Themes'=>['findings'=>4],'Plugins'=>['findings'=>2],'MU plugins & drop-ins'=>['findings'=>2],'Uploads'=>['findings'=>2],'Other wp-content'=>['findings'=>2],'Database'=>['findings'=>2],'Users & persistence'=>['findings'=>2]],'findings'=>array_merge( $core, $themes, $plugins, $mu, $uploads, $other, $database, $users ),
+	'correlations'=>[
+		[
+			'rule'=>'ioc_test','description'=>'Known malicious domain indicator: example.test','severity'=>'critical','confidence'=>99,
+			'sections'=>['Database','Plugins'],
+			'locations'=>[
+				['section'=>'Database','location'=>'wp_options #9 · option_value'],
+				['section'=>'Plugins','location'=>'plugins/bad-plugin/c2.php:5'],
+			],
+		],
+	],
 ];
 $log = new ReflectionMethod( $command, 'write_scan_log' );
 $log->setAccessible( true );
@@ -107,11 +139,13 @@ if ( false === strpos($content,'uploads/a/index.php') || false === strpos($conte
 if ( false === strpos( $content, 'FINDINGS' ) || false === strpos( $content, 'UPLOADS (2 findings)' ) ) { fwrite(STDERR,"Scan log must use clear findings section headers.\n"); exit(1); }
 if ( false === strpos( $content, '[1] HIGH | 96% confidence' ) || false === strpos( $content, 'Locations:' ) ) { fwrite(STDERR,"Grouped scan-log issues must expose severity, confidence, and locations.\n"); exit(1); }
 if ( false !== strpos( $content, 'Rule:' ) || false !== strpos( $content, 'Occurrences:' ) || false !== strpos( $content, 'Version:' ) || false !== strpos( $content, 'Duration:' ) ) { fwrite(STDERR,"Scan log must omit version, duration, rule IDs, and occurrence labels.\n"); exit(1); }
-if ( false === strpos( $content, "Plugin integrity changes\n  File differs from the official plugin checksum\n    - plugins/bad-plugin/b.php" ) || false === strpos( $content, "  Local file is not part of the official plugin package\n    - plugins/bad-plugin/a.php" ) ) { fwrite(STDERR,"Plugin integrity changes must be grouped by problem while preserving affected paths.\n"); exit(1); }
-if ( false === strpos( $content, 'Reason: Plugin files do not match the official package.' ) || false !== stripos( $content, 'replacement threshold' ) ) { fwrite(STDERR,"Scan-log recommendations must stay concise and must not expose internal decision criteria.\n"); exit(1); }
+if ( false === strpos( $content, "[CRITICAL] Plugin integrity changes\nPlugins: bad-plugin\nProblem: File differs from the official plugin checksum\nFiles:\n  - plugins/bad-plugin/b.php" ) || false === strpos( $content, "[CRITICAL] Plugin integrity changes\nPlugins: bad-plugin\nProblem: Local file is not part of the official plugin package\nFiles:\n  - plugins/bad-plugin/a.php" ) ) { fwrite(STDERR,"Plugin integrity changes must use the critical Plugins/Problem/Files layout and preserve affected paths.\n"); exit(1); }
+if ( false === strpos( $content, "[REINSTALL] Plugin files do not match the official package.\n  Plugins:\n    - bad-plugin" ) || false !== stripos( $content, 'replacement threshold' ) ) { fwrite(STDERR,"Scan-log recommendations must be grouped by reason and must not expose internal decision criteria.\n"); exit(1); }
+
+if ( false === strpos( $content, "CORRELATED INDICATORS\n" ) || false === strpos( $content, 'Indicator: Known malicious domain indicator: example.test' ) || false === strpos( $content, '[Database] wp_options #9 · option_value' ) || false === strpos( $content, '[Plugins] plugins/bad-plugin/c2.php:5' ) ) { fwrite(STDERR,"Scan log must render cross-layer exact-IOC correlations with all locations.\n"); exit(1); }
 
 if ( 1 !== substr_count( $content, "Problem: Core file differs from the official WordPress checksum" ) || false === strpos( $content, 'wp-includes/a.php' ) || false === strpos( $content, 'wp-includes/b.php' ) || false === strpos( $content, 'Problem: Unexpected file found in WordPress core' ) || false === strpos( $content, 'wp-admin/extra.php' ) ) { fwrite(STDERR,"Core checksum findings must be grouped by problem while preserving all affected paths.\n"); exit(1); }
-if ( 1 !== substr_count( $content, 'Problem: Users were created in a rapid-registration cluster' ) || false === strpos( $content, 'user #10' ) || false === strpos( $content, 'cluster: 5 accounts within 10 minutes' ) || false === strpos( $content, 'user #11' ) || false === strpos( $content, 'cluster: 6 accounts within 10 minutes' ) ) { fwrite(STDERR,"Users & persistence findings must be grouped by problem while preserving per-user cluster context.\n"); exit(1); }
+if ( 1 !== substr_count( $content, 'Problem: Users were created in a rapid-registration cluster' ) || false === strpos( $content, 'ID   Login' ) || false === strpos( $content, '#10' ) || false === strpos( $content, 'first@example.test' ) || false === strpos( $content, '5 accounts within 10 minutes' ) || false === strpos( $content, '#11' ) || false === strpos( $content, '6 accounts within 10 minutes' ) ) { fwrite(STDERR,"Users & persistence findings must be grouped by problem and rendered in aligned columns while preserving cluster context.\n"); exit(1); }
 if ( 1 !== substr_count( $content, 'Problem: Decoded or remotely sourced payload reaches dynamic PHP code execution' ) || false === strpos( $content, 'BinaryType.php:39' ) || false === strpos( $content, 'BlobType.php:39' ) ) { fwrite(STDERR,"Theme findings must be grouped by problem across all affected theme paths.\n"); exit(1); }
 if ( 1 !== substr_count( $content, 'Problem: Request/cookie data is used through an array element as a dynamic callable' ) || false === strpos( $content, 'live-theme-bak-300520205/includes/woocommerce/notifications.php:287' ) || false === strpos( $content, 'obsidians/includes/woocommerce/notifications.php:221' ) ) { fwrite(STDERR,"Theme callable findings must be grouped by problem across themes.\n"); exit(1); }
 if ( 1 !== substr_count( $content, 'Problem: Shared plugin problem' ) || false === strpos( $content, 'plugins/plugin-a/a.php:10' ) || false === strpos( $content, 'plugins/plugin-b/b.php:20' ) ) { fwrite(STDERR,"Plugin findings must be grouped by problem across plugin paths.\n"); exit(1); }
@@ -123,7 +157,12 @@ $markdown_method->setAccessible( true );
 $markdown = $markdown_method->invoke( $command, $report );
 if ( 1 !== substr_count( $markdown, 'Decoded or remotely sourced payload reaches dynamic PHP code execution' ) || false === strpos( $markdown, 'BinaryType.php:39' ) || false === strpos( $markdown, 'BlobType.php:39' ) ) { fwrite(STDERR,"Markdown theme findings must be grouped by problem.\n"); exit(1); }
 if ( 1 !== substr_count( $markdown, 'Shared plugin problem' ) || false === strpos( $markdown, 'plugins/plugin-a/a.php:10' ) || false === strpos( $markdown, 'plugins/plugin-b/b.php:20' ) ) { fwrite(STDERR,"Markdown plugin findings must be grouped by problem across plugin paths.\n"); exit(1); }
-if ( false === strpos( $content, "\n\nSUMMARY\n" ) || false === strpos( $content, "\n\nFINDINGS\n" ) ) { fwrite(STDERR,"Main scan-log sections must use consistent extra spacing.\n"); exit(1); }
+if ( false === strpos( $markdown, '## Correlated indicators' ) || false === strpos( $markdown, 'Known malicious domain indicator: example.test' ) || false === strpos( $markdown, 'plugins/bad-plugin/c2.php:5' ) ) { fwrite(STDERR,"Markdown must render cross-layer exact-IOC correlations.\n"); exit(1); }
+if ( false === strpos( $content, "WORDPRESS SECURITY SCAN:      2026-09-03T09:53:36+03:00\n" ) ) { fwrite(STDERR,"Scan-log header must use the site's local timezone.\n"); exit(1); }
+if ( false === strpos( $content, "[CLEANUP] Inactive plugins\nPlugins:\n  - Akismet Anti-spam (akismet)\n  - Hello Dolly (hello-dolly)\nStatus: Not scanned.\nAction: Remove if not needed." ) ) { fwrite(STDERR,"Cleanup recommendations must list inactive plugins by name and slug.\n"); exit(1); }
+if ( false === strpos( $content, "[CLEANUP] Inactive themes\nThemes:\n  - Twenty Twenty-Four (twentytwentyfour)\nStatus: Not scanned.\nAction: Remove if not needed." ) ) { fwrite(STDERR,"Cleanup recommendations must list inactive themes by name and slug.\n"); exit(1); }
+if ( 0 !== strpos( $content, 'WORDPRESS SECURITY SCAN:      ' ) || false === strpos( $content, "\n--------------------------------------------------------------------\n" ) ) { fwrite(STDERR,"Scan log must start with the timestamped scan title and 68-character ASCII separator.\n"); exit(1); }
+if ( false !== strpos( $content, "\nSUMMARY\n" ) || false === strpos( $content, "\n\nFINDINGS\n" ) ) { fwrite(STDERR,"Scan log must omit Summary and keep consistent spacing before Findings.\n"); exit(1); }
 if ( false !== strpos( $content, '═' ) || false !== strpos( $content, '─' ) ) { fwrite(STDERR,"Scan log separators must use portable ASCII hyphens.\n"); exit(1); }
 @unlink($path); @rmdir(ABSPATH);
 echo "Grouped report smoke tests passed.\n";

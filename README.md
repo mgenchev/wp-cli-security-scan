@@ -63,6 +63,9 @@ Current checks include:
 - suspicious administrator creation/promotion code;
 - plugins attempting to hide themselves from the Plugins screen;
 - PHP/script files inside `uploads`;
+- media/document uploads whose file signature does not match the declared extension;
+- truncated/malformed PNG, JPEG, WebP, or PDF containers where a bounded structural end check is available;
+- high-confidence script or executable payloads appended after the logical end of a valid media/document container;
 - validated PHP code hidden inside images, SVG, PDF, text, CSS, JS, and similar files; binary files are not treated as PHP from random byte matches;
 - suspicious double extensions such as `image.jpg.php`;
 - `.htaccess` rules enabling PHP execution for additional file types;
@@ -94,13 +97,17 @@ The semantic analyzer can follow patterns such as:
 - `php://input` flowing toward execution;
 - remote payloads flowing into `eval`/command execution or executable PHP files;
 - uploaded/request-controlled payloads written to executable PHP paths;
+- credential/session/payment-like request data flowing to outbound WordPress HTTP calls, cURL, mail, remote URL reads, or socket writes;
+- sensitive arguments forwarded through local helper functions before an outbound transfer;
 - nested statically decodable payloads, including multiple layers of Base64, gzip, ROT13, reverse strings, URL encoding, hex, and UU encoding;
 - custom local decoder helpers, including hex/XOR/`ord()`/`chr()` loops, when their result later becomes a dynamic callback or reaches another dangerous sink;
 - whitespace-to-binary steganography patterns and dense request-controlled callback obfuscation.
 
-The analyzer deliberately does **not** treat normal variable-variable assignment, ordinary callbacks, Base64 decoding, remote API reads, or remote JSON caching as malware by themselves. The goal is to report the dangerous data flow, not merely the presence of a suspicious-looking function.
+The analyzer deliberately does **not** treat normal variable-variable assignment, ordinary callbacks, Base64 decoding, remote API reads, remote JSON caching, or ordinary contact/webhook forwarding as malware by themselves. Outbound-transfer findings require request-derived session/authorization, credential/secret/token, or payment-like data to reach a real outbound transport. The finding describes the observable data flow and does not by itself assert malicious intent.
 
 Broad standalone regex checks for `php://input`, `openssl_decrypt()`, `move_uploaded_file()`, and long hexadecimal strings are intentionally avoided where the semantic analyzer can prove the actual data flow. This keeps strong detection while reducing false positives from payment gateways, cryptography libraries, upload interfaces, and documentation/template files.
+
+Upload container validation is intentionally conservative. Signature mismatches are treated as integrity anomalies, while extra bytes after a valid media/document container are only elevated when the trailing data contains a strong script/executable marker. Appended PHP remains handled by the existing higher-confidence embedded-PHP rule rather than generating a duplicate container finding.
 
 Small and normal PHP files are analyzed as a complete unit so state can be followed across the file. Very large PHP files use overlapping analysis windows to keep memory bounded while retaining the existing streaming signature scan as a fallback.
 
@@ -108,6 +115,7 @@ Standalone semantic smoke tests can be run with:
 
 ```bash
 php tests/data-flow-smoke.php
+php tests/exfiltration-data-flow-smoke.php
 ```
 
 ## Installation
@@ -169,6 +177,15 @@ wp security-scan core
 
 `plugins` also checks plugin reputation, WordPress.org plugin checksums, and MU plugins/drop-ins.
 
+For plugin-created custom database tables, use the opt-in deep database mode:
+
+```bash
+wp security-scan --deep-database
+wp security-scan database --deep-database
+```
+
+Deep database mode scans text-like columns in custom tables belonging to the current site prefix. Standard WordPress tables are not scanned twice, and on multisite the main-site scan does not cross into another blog's numbered table prefix. Numeric primary keys use keyset pagination; unconventional schemas use bounded `LIMIT/OFFSET` fallback. Binary/blob columns are intentionally excluded from this layer to avoid loading large media/binary payloads and introducing low-value byte-pattern matches.
+
 ## Example report
 
 ```text
@@ -198,7 +215,7 @@ Detailed findings saved to /path/from/which/the/scan/was/run/security-scan.log
 
 Detailed findings are intentionally not printed in the interactive terminal report. File-content findings, affected paths and source lines are preserved in `security-scan.log`; filename-only, checksum, symlink, and database findings may not have a line number.
 
-The final terminal summary includes severity counts, files scanned, database rows scanned, administrator count, total findings, and scan duration. Detailed Findings and Recommendations are kept in `security-scan.log` so the console remains concise while the evidence and remediation guidance stay together for incident review.
+The final terminal summary includes severity counts, files scanned, database rows scanned, administrator count, total findings, and scan duration. The Summary is console-only; detailed Findings and Recommendations are kept in `security-scan.log` so the evidence and remediation guidance stay together for incident review.
 
 
 ## Plugin and theme scan scope
@@ -229,7 +246,7 @@ Plugin scope: all installed regular plugins.
 Theme scope: all installed themes.
 ```
 
-Inactive plugin/theme cleanup guidance is intentionally shown only once in the final Recommendations block. In full-scan mode it states that the inactive code was included in the scan while still recommending removal when it is not needed.
+Inactive plugin/theme cleanup guidance is intentionally shown only once in the final Recommendations block. The scan log lists every inactive plugin/theme by name and slug, states whether it was included in `--full-scan`, and recommends removal when it is not needed.
 
 
 ## Full scan mode
@@ -272,7 +289,9 @@ The users stage also treats recent account creation as an incident-review signal
 - for privileged accounts, 2 or more created within the same 10-minute window are enough for `CRITICAL`;
 - users in a rapid-registration cluster are shown only once at the higher `CRITICAL` severity.
 
-User findings include the user ID, login, email, role(s), and UTC registration timestamp. In the detailed scan log, repeated users/persistence findings are grouped by problem while every affected user or cron location is preserved; rapid-registration locations retain the detected cluster size. On multisite, network `site_admins` are treated as privileged for burst detection without loading WordPress user APIs. Burst detection is limited to the same 2-month incident window so historical imports and migrations do not dominate the report. Cron persistence scanning continues to run in the same stage.
+User findings include the user ID, login, email, role(s), and UTC registration timestamp. The persistence stage also reviews role/capability state without loading `WP_User`: built-in non-administrator roles that gain core administrative capabilities are treated as stronger signals, custom administrative roles are surfaced for review, and direct administrative capabilities assigned to non-administrator users are reported separately. Recent WordPress application passwords are reported only when attached to a privileged account; stored password hashes are never written to findings or logs.
+
+In the detailed scan log, repeated users/persistence findings are grouped by problem while every affected user, cron, or Action Scheduler location is preserved; rapid-registration locations retain the detected cluster size. On multisite, network `site_admins` are treated as privileged for burst detection without loading WordPress user APIs. Burst detection is limited to the same 2-month incident window so historical imports and migrations do not dominate the report. WP-Cron and active Action Scheduler jobs are scanned using the existing strong IOC/persistence rules; normal scheduled hooks are not suspicious by themselves.
 
 ## Database scanning
 
@@ -324,30 +343,30 @@ Integrity remains an **internal remediation signal**. The live checklist shows o
 
 For plugins without trusted checksums, finding severity is combined internally to choose between manual review and a fresh-copy recommendation. The decision mechanics are not exposed in reports or recommendation messages.
 
-Human-readable finding reports group evidence by the human-readable problem type and preserve every affected path/line beneath that problem. This applies consistently to Themes, Plugins, MU plugins/drop-ins, Uploads, Other `wp-content`, Database, Core checksums, and Users/Persistence. Plugin paths keep the full `plugins/<slug>/...` prefix, while remediation remains plugin-specific so replacement/review recommendations are not lost. JSON output remains raw per-finding evidence rather than grouped presentation data.
+Human-readable finding reports group evidence by the human-readable problem type and preserve every affected path/line beneath that problem. This applies consistently to Themes, Plugins, MU plugins/drop-ins, Uploads, Other `wp-content`, Database, Core checksums, and Users/Persistence. Plugin paths keep the full `plugins/<slug>/...` prefix, while remediation remains plugin-specific so replacement/review recommendations are not lost. JSON output remains raw per-finding evidence rather than grouped presentation data. Exact known IOC rules are additionally correlated across scan layers: when the same indicator appears in two or more sections, the detailed log and Markdown report show one **Correlated indicators** block with every contributing location. Correlation is contextual evidence only and does not add findings or change severity totals.
 
-All remediation guidance is collected once in the **Recommendations** block in the detailed report, including fresh-copy actions, manual-review actions, and inactive plugin/theme cleanup notices. Internal decision criteria are not exposed in recommendation messages.
+All remediation guidance is collected once in the **Recommendations** block in the detailed report, including fresh-copy actions, manual-review actions, and inactive plugin/theme cleanup notices. Plugin recommendations are grouped by action and user-facing reason so equivalent remediation is shown once with all affected plugin slugs. Internal decision criteria are not exposed in recommendation messages.
 
-Recommendation messages stay short and describe the observed condition rather than the internal scoring rule used to select an action. Examples:
+Recommendation messages stay short and describe the observed condition rather than the internal scoring rule used to select an action. Equivalent recommendations are grouped so the same reason is shown once with every affected plugin:
 
 ```text
-[REINSTALL] modified-plugin
-  Reason: Plugin files do not match the official package.
+[REINSTALL] Plugin files do not match the official package.
+  Plugins:
+    - modified-plugin-a
+    - modified-plugin-b
 
-[REINSTALL] suspicious-plugin
-  Reason: Multiple high-risk findings were detected.
-
-[REVIEW] premium-plugin
-  Reason: Suspicious findings require manual review.
-
-[REVIEW] verified-plugin
-  Reason: High-confidence findings remain despite verified files.
+[REVIEW] Suspicious findings require manual review.
+  Plugins:
+    - premium-plugin-a
+    - premium-plugin-b
 ```
 
 
 ### Verified but still suspicious plugins
 
-A successful checksum proves that the local files match the upstream WordPress.org release; it does **not** prove that the upstream release itself is safe. To preserve this distinction, verified plugins suppress ordinary heuristics but still allow independent plugin-risk signals:
+A successful checksum proves that the local files match the upstream WordPress.org release; it does **not** prove that the upstream release itself is safe. To preserve this distinction, verified plugins suppress ordinary heuristics but still allow independent plugin-risk signals. The file scanner uses the same trust policy as a performance fast path: checksum-verified plugins do not run the expensive semantic/regex/density analyzers whose findings would be suppressed later; executable PHP/JavaScript files are still checked for exact `CRITICAL` IOCs at 97%+ confidence.
+
+Remaining reportable signals include:
 
 - WordPress.org reports the plugin as closed or disabled;
 - the plugin matches an exact high-confidence rule from `rules/plugin-reputation.json`;
@@ -419,7 +438,7 @@ Skip WordPress.org plugin checksum verification:
 wp security-scan --skip-plugin-checksums
 ```
 
-Premium/custom plugins without WordPress.org checksums are still scanned by the static malware engine and use the weighted risk score. If plugin checksum verification is skipped entirely, installed plugins are treated as unverified rather than trusted.
+Premium/custom plugins without WordPress.org checksums are still scanned by the full static malware engine and use the scanner's internal risk assessment. If plugin checksum verification is skipped entirely, installed plugins are treated as unverified rather than trusted.
 
 ## Extending known indicators
 
@@ -440,7 +459,7 @@ wp security-scan version
 
 ## Important limitation
 
-No static scanner can prove that a site is clean. Malware can be novel, encrypted, environment-dependent, stored in custom database tables, or intentionally designed to mimic legitimate code. Findings should be reviewed in the context of the affected site.
+No static scanner can prove that a site is clean. Malware can be novel, encrypted, environment-dependent, stored in binary/unscanned database fields or custom tables not covered unless `--deep-database` is enabled, or intentionally designed to mimic legitimate code. Findings should be reviewed in the context of the affected site.
 
 
 ### Variable-variable detection
@@ -449,4 +468,4 @@ Legitimate variable-variable assignments such as `$$key = $value` are not report
 
 ### Automatic scan log
 
-Every completed scan overwrites `security-scan.log` in the directory from which the scan was launched. The log is intended for manual incident review and uses separate Summary, Findings, and Recommendations blocks. Findings use a compact numbered layout showing severity, confidence, the problem, and every affected path/line. All human-readable finding sections are grouped consistently by problem type, including Themes, Plugins, MU plugins/drop-ins, Uploads, Other `wp-content`, Database, Core checksums, and Users/Persistence. Plugin checksum/integrity changes are also grouped by problem while preserving every affected plugin path. `Local file is not part of the official plugin package` means the local file exists inside the plugin directory but is absent from the official WordPress.org checksum manifest for that exact slug/version; it is an integrity mismatch, not by itself proof of malware. Symlinked plugin roots/paths are treated as modified integrity rather than eligible for verified-plugin suppression. Interactive scans keep the console concise with the Summary only, then print the scan-log path; detailed Findings and Recommendations remain in `security-scan.log`.
+Every completed scan overwrites `security-scan.log` in the directory from which the scan was launched. The log starts with a single `WORDPRESS SECURITY SCAN:` line using the site-local WordPress timezone (`timezone_string`, with `gmt_offset` fallback), followed by a portable 68-character ASCII separator. It is intended for manual incident review and contains Findings and Recommendations; the Summary remains console-only. Findings use a compact numbered layout showing severity, confidence, the problem, and every affected path/line. All human-readable finding sections are grouped consistently by problem type, including Themes, Plugins, MU plugins/drop-ins, Uploads, Other `wp-content`, Database, Core checksums, and Users/Persistence. Structured user-account, direct-capability, and application-password findings are rendered in aligned columns for easier review; cron and Action Scheduler evidence keeps the standard location layout. When an exact known IOC appears in multiple scan layers, the log adds a separate `CORRELATED INDICATORS` block that links the evidence without increasing the finding count. Plugin checksum/integrity changes are grouped by problem and rendered as `[CRITICAL] Plugin integrity changes` blocks with separate `Plugins`, `Problem`, and `Files` fields. `Local file is not part of the official plugin package` means the local file exists inside the plugin directory but is absent from the official WordPress.org checksum manifest for that exact slug/version; it is an integrity mismatch, not by itself proof of malware. Symlinked plugin roots/paths are treated as modified integrity rather than eligible for verified-plugin suppression. Inactive-code CLEANUP entries in the log list each plugin/theme by name and slug together with concise scan status and removal guidance. Interactive scans keep the console concise with the Summary only, then print the scan-log path; detailed Findings and Recommendations remain in `security-scan.log`.

@@ -14,7 +14,7 @@ if ( ! class_exists( 'Security_Scan_Database', false ) ) {
 }
 
 class Security_Scan_Command {
-	private const VERSION = '1.0.0';
+	private const VERSION = '1.1.0';
 	private const DB_BATCH_SIZE = 500;
 	private const USER_BATCH_SIZE = 100;
 	private const FILE_CHUNK_SIZE = 524288;
@@ -29,6 +29,29 @@ class Security_Scan_Command {
 	private const PLUGIN_REINSTALL_SCORE_THRESHOLD = 10;
 	private const HTTP_PARALLEL_LIMIT = 6;
 	private const HTTP_RESPONSE_MAX_BYTES = 16777216;
+	private const APPLICATION_PASSWORD_META_KEY = '_application_passwords';
+	private const SCAN_LOG_SEPARATOR_WIDTH = 68;
+
+	private const ADMINISTRATIVE_CAPABILITIES = [
+		'manage_options',
+		'edit_users',
+		'promote_users',
+		'create_users',
+		'delete_users',
+		'install_plugins',
+		'activate_plugins',
+		'update_plugins',
+		'delete_plugins',
+		'update_core',
+		'switch_themes',
+	];
+
+	private const BUILTIN_NON_ADMIN_ROLES = [
+		'editor',
+		'author',
+		'contributor',
+		'subscriber',
+	];
 
 	private const SEVERITY_WEIGHT = [
 		'critical' => 4,
@@ -62,6 +85,12 @@ class Security_Scan_Command {
 		'txt', 'js', 'css',
 	];
 
+	private const UPLOAD_CONTAINER_EXTENSIONS = [
+		'jpg', 'jpeg', 'png', 'gif', 'webp', 'avif', 'ico', 'bmp', 'tif', 'tiff', 'pdf',
+	];
+
+	private const UPLOAD_CONTAINER_TAIL_MAX_BYTES = 262144;
+
 	private const DROPIN_FILES = [
 		'advanced-cache.php',
 		'db.php',
@@ -86,9 +115,9 @@ class Security_Scan_Command {
 	private $current_stage = '';
 	private $start_time = 0.0;
 	private $admin_count = 0;
-	private $modification_clusters = [];
 	private $include_node_modules = false;
 	private $full_scan = false;
+	private $deep_database = false;
 	private $background_spinner_process = null;
 	private $php_data_flow_analyzer = null;
 	private $plugin_integrity = [];
@@ -117,6 +146,8 @@ class Security_Scan_Command {
 	private $runtime_warnings = [];
 	private $site_home_host = '';
 	private $plugin_sha256_available = null;
+	private $verified_plugin_ioc_rules = null;
+	private $table_column_cache = [];
 
 	/**
 	 * Run a complete security scan.
@@ -161,6 +192,9 @@ class Security_Scan_Command {
 	 *
 	 * [--full-scan]
 	 * : Include inactive regular plugins in reputation/checksum/static scans and inactive themes in static scans.
+	 *
+	 * [--deep-database]
+	 * : Also scan text-like columns in custom tables for the current site prefix.
 	 *
 	 * ## EXAMPLES
 	 *
@@ -228,6 +262,11 @@ class Security_Scan_Command {
 	/**
 	 * Scan database content only.
 	 *
+	 * ## OPTIONS
+	 *
+	 * [--deep-database]
+	 * : Also scan text-like columns in custom tables for the current site prefix.
+	 *
 	 * @when before_wp_load
 	 */
 	public function database( $args, $assoc_args ) {
@@ -263,6 +302,7 @@ class Security_Scan_Command {
 		$this->configure_output( $assoc_args );
 		$this->include_node_modules = isset( $assoc_args['include-node-modules'] );
 		$this->full_scan = isset( $assoc_args['full-scan'] );
+		$this->deep_database = isset( $assoc_args['deep-database'] );
 		$this->suppress_wordpress_debug();
 		$this->start_time = microtime( true );
 		$this->launch_directory = $this->resolve_launch_directory();
@@ -376,9 +416,9 @@ class Security_Scan_Command {
 		$this->last_spinner_at = 0.0;
 		$this->current_stage = '';
 		$this->admin_count = 0;
-		$this->modification_clusters = [];
 		$this->include_node_modules = false;
 		$this->full_scan = false;
+		$this->deep_database = false;
 		$this->php_data_flow_analyzer = null;
 		$this->plugin_integrity = [];
 		$this->plugin_scan_files = [];
@@ -405,6 +445,9 @@ class Security_Scan_Command {
 		$this->theme_scope_reliable = true;
 		$this->runtime_warnings = [];
 		$this->site_home_host = '';
+		$this->plugin_sha256_available = null;
+		$this->verified_plugin_ioc_rules = null;
+		$this->table_column_cache = [];
 	}
 
 	/**
@@ -2621,6 +2664,7 @@ class Security_Scan_Command {
 	private function render_scan_scope_notices( array $sections ) {
 		$show_plugins = (bool) array_intersect( [ 'plugin_reputation', 'plugin_checksums', 'plugins' ], $sections );
 		$show_themes = in_array( 'themes', $sections, true );
+		$show_database = in_array( 'database', $sections, true );
 
 		if ( $show_plugins ) {
 			\WP_CLI::log( ( $this->full_scan || ! $this->plugin_scope_reliable )
@@ -2632,6 +2676,10 @@ class Security_Scan_Command {
 			\WP_CLI::log( ( $this->full_scan || ! $this->theme_scope_reliable )
 				? 'Theme scope: all installed themes.'
 				: 'Theme scope: active theme and parent theme only, when applicable.' );
+		}
+
+		if ( $show_database && $this->deep_database ) {
+			\WP_CLI::log( 'Database scope: standard WordPress tables plus current-site custom text tables.' );
 		}
 
 		$shown_warning = false;
@@ -2646,7 +2694,7 @@ class Security_Scan_Command {
 			$shown_warning = true;
 		}
 
-		if ( $show_plugins || $show_themes || $shown_warning ) {
+		if ( $show_plugins || $show_themes || ( $show_database && $this->deep_database ) || $shown_warning ) {
 			\WP_CLI::log( '' );
 		}
 	}
@@ -2670,10 +2718,25 @@ class Security_Scan_Command {
 			$root = '.' === $relative_dir
 				? $this->plugin_dir . DIRECTORY_SEPARATOR . $main_file
 				: $this->plugin_dir . DIRECTORY_SEPARATOR . $relative_dir;
-			$roots[ $this->normalize_path( $root ) ] = $root;
+			$key = $this->normalize_path( $root );
+			$is_verified = 'verified' === (string) ( $data['status'] ?? 'unverified' );
+
+			if ( ! isset( $roots[ $key ] ) ) {
+				$roots[ $key ] = [
+					'path'     => $root,
+					'verified' => $is_verified,
+				];
+			} elseif ( ! $is_verified ) {
+				// Multiple plugin headers may share one directory. Only use the
+				// fast path when every selected plugin rooted there is verified.
+				$roots[ $key ]['verified'] = false;
+			}
 		}
 
-		foreach ( $roots as $root ) {
+		foreach ( $roots as $root_data ) {
+			$root = $root_data['path'];
+			$verified_fast_path = ! empty( $root_data['verified'] );
+
 			if ( is_link( $root ) ) {
 				$this->scan_symlink( $stage, $root );
 				continue;
@@ -2683,7 +2746,11 @@ class Security_Scan_Command {
 				$count++;
 				$this->scanned_files++;
 				$this->stage_tick( $stage, $count, 'files' );
-				$this->scan_file( $stage, $root, false );
+				if ( $verified_fast_path ) {
+					$this->scan_verified_plugin_file( $stage, $root );
+				} else {
+					$this->scan_file( $stage, $root, false );
+				}
 				continue;
 			}
 
@@ -2704,11 +2771,101 @@ class Security_Scan_Command {
 				$count++;
 				$this->scanned_files++;
 				$this->stage_tick( $stage, $count, 'files' );
-				$this->scan_file( $stage, $item->getPathname(), false );
+				if ( $verified_fast_path ) {
+					$this->scan_verified_plugin_file( $stage, $item->getPathname() );
+				} else {
+					$this->scan_file( $stage, $item->getPathname(), false );
+				}
 			}
 		}
 
 		$this->stage_finish( $stage, $count, $this->count_reportable_plugin_findings() );
+	}
+
+	/**
+	 * Scan a checksum-verified plugin file only for findings that remain
+	 * reportable after checksum trust is applied.
+	 *
+	 * Verified WordPress.org plugins suppress normal static/semantic heuristics
+	 * at report time. Running those expensive analyzers first wastes CPU and I/O.
+	 * Keep exact high-confidence IOC coverage in executable PHP/JS files, which
+	 * is exactly the file-level evidence still allowed by
+	 * is_verified_plugin_risk_finding().
+	 */
+	private function scan_verified_plugin_file( $stage, $path ) {
+		$extension = strtolower( pathinfo( $path, PATHINFO_EXTENSION ) );
+		$executable_extensions = array_merge( self::PHP_EXTENSIONS, [ 'js', 'mjs', 'cjs' ] );
+		if ( ! in_array( $extension, $executable_extensions, true ) ) {
+			return;
+		}
+
+		$rules = $this->verified_plugin_ioc_rules();
+		if ( empty( $rules ) ) {
+			return;
+		}
+
+		$handle = @fopen( $path, 'rb' );
+		if ( false === $handle ) {
+			return;
+		}
+
+		$relative = $this->relative_wp_content_path( $path );
+		$seen = [];
+		$overlap = '';
+		$line_at_chunk_start = 1;
+
+		while ( ! feof( $handle ) ) {
+			$chunk = fread( $handle, self::FILE_CHUNK_SIZE );
+			if ( false === $chunk || '' === $chunk ) {
+				break;
+			}
+
+			$buffer = $overlap . $chunk;
+			$buffer_start_line = max( 1, $line_at_chunk_start - substr_count( $overlap, "\n" ) );
+			foreach ( $rules as $rule ) {
+				$match_offset = stripos( $buffer, $rule['needle'] );
+				if ( false === $match_offset ) {
+					continue;
+				}
+
+				$this->add_file_rule_once(
+					$seen,
+					$stage,
+					$relative,
+					$rule,
+					$this->line_from_buffer_offset( $buffer, $buffer_start_line, $match_offset )
+				);
+			}
+
+			$overlap = substr( $buffer, -self::FILE_CHUNK_OVERLAP );
+			$line_at_chunk_start += substr_count( $chunk, "\n" );
+			$this->stage_heartbeat( $stage, 'files' );
+		}
+
+		fclose( $handle );
+	}
+
+	/**
+	 * Cache the exact IOC rules that remain reportable for verified plugins.
+	 */
+	private function verified_plugin_ioc_rules() {
+		if ( null !== $this->verified_plugin_ioc_rules ) {
+			return $this->verified_plugin_ioc_rules;
+		}
+
+		$this->verified_plugin_ioc_rules = array_values(
+			array_filter(
+				$this->rules['iocs'] ?? [],
+				static function ( $rule ) {
+					return 0 === strpos( (string) ( $rule['id'] ?? '' ), 'ioc_' )
+						&& 'critical' === (string) ( $rule['severity'] ?? '' )
+						&& (int) ( $rule['confidence'] ?? 0 ) >= 97
+						&& '' !== (string) ( $rule['needle'] ?? '' );
+				}
+			)
+		);
+
+		return $this->verified_plugin_ioc_rules;
 	}
 
 	/**
@@ -2971,6 +3128,11 @@ class Security_Scan_Command {
 			return;
 		}
 
+		if ( $is_uploads && in_array( $extension, self::UPLOAD_CONTAINER_EXTENSIONS, true ) ) {
+			$this->scan_upload_media_container( $handle, $path, $relative, $extension, $seen );
+			@rewind( $handle );
+		}
+
 		$overlap = '';
 		$line_at_chunk_start = 1;
 
@@ -2989,6 +3151,264 @@ class Security_Scan_Command {
 		}
 
 		fclose( $handle );
+	}
+
+	/**
+	 * Validate common upload media/document containers without parsing them through
+	 * image/PDF libraries. Signature mismatches are integrity anomalies; trailing
+	 * bytes are only reported when they contain a high-confidence script/executable
+	 * marker so legitimate metadata/junk does not become a security finding.
+	 */
+	private function scan_upload_media_container( $handle, $path, $relative, $extension, array &$seen ) {
+		$expected = $this->expected_upload_container_type( $extension );
+		if ( null === $expected ) {
+			return;
+		}
+
+		$size = @filesize( $path );
+		if ( false === $size || $size <= 0 ) {
+			$this->add_file_finding_once( $seen, 'Uploads', 'medium', 82, $relative, 'upload_invalid_media_signature', 'Upload does not have a valid media/document file signature' );
+			return;
+		}
+
+		@rewind( $handle );
+		$head = fread( $handle, 1024 );
+		if ( false === $head ) {
+			return;
+		}
+
+		$detected = $this->detect_upload_container_type( $head );
+		if ( $expected !== $detected ) {
+			// PHP hidden behind a media extension is already a stronger CRITICAL
+			// finding in scan_file_buffer(); avoid a duplicate container finding.
+			if ( 'php' === $detected ) {
+				return;
+			}
+
+			if ( null !== $detected ) {
+				$this->add_file_finding_once( $seen, 'Uploads', 'high', 94, $relative, 'upload_media_type_mismatch', 'Upload contents match a different file type than the extension' );
+			} else {
+				$this->add_file_finding_once( $seen, 'Uploads', 'medium', 82, $relative, 'upload_invalid_media_signature', 'Upload does not have a valid media/document file signature' );
+			}
+			return;
+		}
+
+		$container = $this->resolve_upload_container_end( $handle, $extension, (int) $size );
+		if ( isset( $container['invalid'] ) && $container['invalid'] ) {
+			$this->add_file_finding_once( $seen, 'Uploads', 'medium', 84, $relative, 'upload_malformed_media_container', 'Upload media/document container appears truncated or malformed' );
+			return;
+		}
+
+		if ( ! isset( $container['end'] ) || null === $container['end'] || $container['end'] >= $size ) {
+			return;
+		}
+
+		$trailing_length = min( self::UPLOAD_CONTAINER_TAIL_MAX_BYTES, (int) $size - (int) $container['end'] );
+		if ( $trailing_length <= 0 || 0 !== @fseek( $handle, (int) $container['end'], SEEK_SET ) ) {
+			return;
+		}
+
+		$trailing = fread( $handle, $trailing_length );
+		if ( false === $trailing || '' === $trailing ) {
+			return;
+		}
+
+		$trimmed = ltrim( $trailing, "\x00\x09\x0A\x0D\x20" );
+		if ( '' === $trimmed ) {
+			return;
+		}
+
+		// PHP tags are already handled by uploads_embedded_php at CRITICAL.
+		if ( false !== stripos( $trimmed, '<?php' ) || false !== strpos( $trimmed, '<?=' ) ) {
+			return;
+		}
+
+		if ( 0 === strpos( $trimmed, "\x7fELF" ) || 0 === strpos( $trimmed, 'MZ' ) ) {
+			$this->add_file_finding_once( $seen, 'Uploads', 'high', 97, $relative, 'upload_appended_executable', 'Executable payload is appended after the media/document container' );
+			return;
+		}
+
+		$sample = substr( $trimmed, 0, 32768 );
+		$printable = preg_match_all( '/[\x09\x0A\x0D\x20-\x7E]/', $sample, $matches );
+		if ( false === $printable || ( $printable / max( 1, strlen( $sample ) ) ) < 0.78 ) {
+			return;
+		}
+
+		if ( 1 === preg_match( '~(?:<script\b|#!\s*/(?:usr/)?bin/|\b(?:powershell|cmd\.exe)\b|\b(?:eval|assert|base64_decode|shell_exec|passthru|system)\s*\()~i', $sample ) ) {
+			$this->add_file_finding_once( $seen, 'Uploads', 'high', 95, $relative, 'upload_appended_script_payload', 'Script-like payload is appended after the media/document container' );
+		}
+	}
+
+	/**
+	 * Map upload extensions to the expected container signature family.
+	 */
+	private function expected_upload_container_type( $extension ) {
+		$map = [
+			'jpg'  => 'jpeg',
+			'jpeg' => 'jpeg',
+			'png'  => 'png',
+			'gif'  => 'gif',
+			'webp' => 'webp',
+			'avif' => 'avif',
+			'ico'  => 'ico',
+			'bmp'  => 'bmp',
+			'tif'  => 'tiff',
+			'tiff' => 'tiff',
+			'pdf'  => 'pdf',
+		];
+
+		return isset( $map[ $extension ] ) ? $map[ $extension ] : null;
+	}
+
+	/**
+	 * Detect a small set of trusted magic-byte families used for upload validation.
+	 */
+	private function detect_upload_container_type( $head ) {
+		if ( 0 === strpos( $head, "\x89PNG\r\n\x1a\n" ) ) {
+			return 'png';
+		}
+		if ( 0 === strpos( $head, "\xff\xd8\xff" ) ) {
+			return 'jpeg';
+		}
+		if ( 0 === strpos( $head, 'GIF87a' ) || 0 === strpos( $head, 'GIF89a' ) ) {
+			return 'gif';
+		}
+		if ( strlen( $head ) >= 12 && 'RIFF' === substr( $head, 0, 4 ) && 'WEBP' === substr( $head, 8, 4 ) ) {
+			return 'webp';
+		}
+		if ( strlen( $head ) >= 16 && 'ftyp' === substr( $head, 4, 4 ) ) {
+			$brands = substr( $head, 8, 56 );
+			if ( false !== strpos( $brands, 'avif' ) || false !== strpos( $brands, 'avis' ) ) {
+				return 'avif';
+			}
+		}
+		if ( 0 === strpos( $head, "\x00\x00\x01\x00" ) ) {
+			return 'ico';
+		}
+		if ( 0 === strpos( $head, 'BM' ) ) {
+			return 'bmp';
+		}
+		if ( 0 === strpos( $head, "II*\x00" ) || 0 === strpos( $head, "MM\x00*" ) ) {
+			return 'tiff';
+		}
+		if ( false !== strpos( substr( $head, 0, 1024 ), '%PDF-' ) ) {
+			return 'pdf';
+		}
+		if ( false !== stripos( substr( $head, 0, 1024 ), '<?php' ) || false !== strpos( substr( $head, 0, 1024 ), '<?=' ) ) {
+			return 'php';
+		}
+		if ( 0 === strpos( $head, "PK\x03\x04" ) || 0 === strpos( $head, "PK\x05\x06" ) || 0 === strpos( $head, "PK\x07\x08" ) ) {
+			return 'zip';
+		}
+		if ( 0 === strpos( $head, "\x1f\x8b" ) ) {
+			return 'gzip';
+		}
+		if ( 0 === strpos( $head, "Rar!\x1a\x07" ) ) {
+			return 'rar';
+		}
+		if ( 0 === strpos( $head, "7z\xbc\xaf\x27\x1c" ) ) {
+			return '7z';
+		}
+		if ( 0 === strpos( $head, "\x7fELF" ) ) {
+			return 'elf';
+		}
+		if ( 0 === strpos( $head, 'MZ' ) ) {
+			return 'pe';
+		}
+
+		return null;
+	}
+
+	/**
+	 * Resolve the logical end of containers where a reliable bounded end marker
+	 * is available. Formats without a safe cheap boundary return null.
+	 */
+	private function resolve_upload_container_end( $handle, $extension, $size ) {
+		if ( 'png' === $extension ) {
+			return $this->resolve_png_end( $handle, $size );
+		}
+
+		if ( 'webp' === $extension ) {
+			if ( 0 !== @fseek( $handle, 4, SEEK_SET ) ) {
+				return [ 'end' => null, 'invalid' => false ];
+			}
+			$raw = fread( $handle, 4 );
+			if ( false === $raw || 4 !== strlen( $raw ) ) {
+				return [ 'end' => null, 'invalid' => true ];
+			}
+			$unpacked = unpack( 'Vsize', $raw );
+			$end = 8 + (int) $unpacked['size'];
+			return [ 'end' => $end, 'invalid' => $end < 12 || $end > $size ];
+		}
+
+		if ( in_array( $extension, [ 'jpg', 'jpeg' ], true ) ) {
+			return $this->resolve_tail_marker_end( $handle, $size, "\xff\xd9", 2 );
+		}
+
+		if ( 'pdf' === $extension ) {
+			return $this->resolve_tail_marker_end( $handle, $size, '%%EOF', 5 );
+		}
+
+		return [ 'end' => null, 'invalid' => false ];
+	}
+
+	/**
+	 * Parse PNG chunk boundaries without decoding image data.
+	 */
+	private function resolve_png_end( $handle, $size ) {
+		$offset = 8;
+		$chunks = 0;
+		$has_ihdr = false;
+		while ( $offset + 12 <= $size && $chunks < 100000 ) {
+			if ( 0 !== @fseek( $handle, $offset, SEEK_SET ) ) {
+				return [ 'end' => null, 'invalid' => true ];
+			}
+			$header = fread( $handle, 8 );
+			if ( false === $header || 8 !== strlen( $header ) ) {
+				return [ 'end' => null, 'invalid' => true ];
+			}
+			$length_data = unpack( 'Nlength', substr( $header, 0, 4 ) );
+			$length = (int) $length_data['length'];
+			$type = substr( $header, 4, 4 );
+			$chunk_end = $offset + 12 + $length;
+			if ( $chunk_end > $size || $length < 0 ) {
+				return [ 'end' => null, 'invalid' => true ];
+			}
+			if ( 0 === $chunks ) {
+				if ( 'IHDR' !== $type || 13 !== $length ) {
+					return [ 'end' => null, 'invalid' => true ];
+				}
+				$has_ihdr = true;
+			}
+			if ( 'IEND' === $type ) {
+				return [ 'end' => $chunk_end, 'invalid' => ! $has_ihdr || 0 !== $length ];
+			}
+			$offset = $chunk_end;
+			$chunks++;
+		}
+
+		return [ 'end' => null, 'invalid' => true ];
+	}
+
+	/**
+	 * Find the last bounded end marker for JPEG/PDF containers.
+	 */
+	private function resolve_tail_marker_end( $handle, $size, $marker, $marker_length ) {
+		$read_length = min( self::UPLOAD_CONTAINER_TAIL_MAX_BYTES, $size );
+		$start = $size - $read_length;
+		if ( 0 !== @fseek( $handle, $start, SEEK_SET ) ) {
+			return [ 'end' => null, 'invalid' => false ];
+		}
+		$tail = fread( $handle, $read_length );
+		if ( false === $tail ) {
+			return [ 'end' => null, 'invalid' => false ];
+		}
+		$position = strrpos( $tail, $marker );
+		if ( false === $position ) {
+			return [ 'end' => null, 'invalid' => true ];
+		}
+
+		return [ 'end' => $start + $position + $marker_length, 'invalid' => false ];
 	}
 
 	/**
@@ -3453,7 +3873,237 @@ class Security_Scan_Command {
 			$total_rows += $this->scan_database_table( $stage, $definition );
 		}
 
+		if ( $this->deep_database ) {
+			$excluded_tables = array_column( $definitions, 'table' );
+			$total_rows += $this->scan_deep_database_tables( $stage, $excluded_tables );
+		}
+
 		$this->stage_finish( $stage, $total_rows, $this->count_stage_findings( $stage ), 'rows' );
+	}
+
+
+	/**
+	 * Scan text-like columns in custom tables for the current site prefix.
+	 *
+	 * This is opt-in because plugin tables can be very large. Schema discovery is
+	 * read-only, core tables are excluded, and other multisite blogs are not
+	 * traversed when scanning the main-site prefix.
+	 */
+	private function scan_deep_database_tables( $stage, array $excluded_tables ) {
+		$total_rows = 0;
+		foreach ( $this->discover_deep_database_tables( $excluded_tables ) as $table ) {
+			$definition = $this->deep_database_table_definition( $table );
+			if ( empty( $definition['fields'] ) ) {
+				continue;
+			}
+			$total_rows += $this->scan_deep_database_table( $stage, $definition );
+		}
+		return $total_rows;
+	}
+
+	/**
+	 * Discover custom tables belonging to the current site without crossing into
+	 * another blog's numbered multisite prefix.
+	 */
+	private function discover_deep_database_tables( array $excluded_tables ) {
+		$db = $this->database;
+		if ( ! $db || '' === $this->site_table_prefix ) {
+			return [];
+		}
+
+		$excluded = array_fill_keys( array_merge( $excluded_tables, $this->known_wordpress_tables() ), true );
+		$pattern = $db->esc_like( $this->site_table_prefix ) . '%';
+		$rows = $db->get_results( $db->prepare( 'SHOW TABLES LIKE %s', $pattern ), true );
+		$tables = [];
+		$other_blog_pattern = '';
+		if ( $this->site_table_prefix === $this->base_table_prefix ) {
+			$other_blog_pattern = '/^' . preg_quote( $this->base_table_prefix, '/' ) . '\\d+_/';
+		}
+
+		foreach ( $rows as $row ) {
+			if ( ! is_array( $row ) || empty( $row ) ) {
+				continue;
+			}
+			$table = (string) reset( $row );
+			if ( '' === $table || isset( $excluded[ $table ] ) ) {
+				continue;
+			}
+			if ( '' !== $other_blog_pattern && preg_match( $other_blog_pattern, $table ) ) {
+				continue;
+			}
+			$tables[] = $table;
+		}
+
+		sort( $tables, SORT_STRING );
+		return array_values( array_unique( $tables ) );
+	}
+
+	/**
+	 * Core/global WordPress tables that deep mode must not rescan as custom data.
+	 */
+	private function known_wordpress_tables() {
+		$site = $this->site_table_prefix;
+		$base = $this->base_table_prefix;
+		$tables = [];
+		foreach ( [ 'posts', 'postmeta', 'terms', 'termmeta', 'term_taxonomy', 'term_relationships', 'comments', 'commentmeta', 'links', 'options' ] as $suffix ) {
+			$tables[] = $site . $suffix;
+		}
+		foreach ( [ 'users', 'usermeta', 'blogs', 'blog_versions', 'registration_log', 'signups', 'site', 'sitemeta', 'sitecategories' ] as $suffix ) {
+			$tables[] = $base . $suffix;
+		}
+		foreach ( [ 'actionscheduler_actions', 'actionscheduler_claims', 'actionscheduler_groups', 'actionscheduler_logs' ] as $suffix ) {
+			$tables[] = $site . $suffix;
+		}
+		if ( $this->database ) {
+			$tables[] = $this->database->users;
+			$tables[] = $this->database->usermeta;
+		}
+		return array_values( array_unique( array_filter( $tables ) ) );
+	}
+
+	/**
+	 * Return cached column metadata for a table during one scan run.
+	 */
+	private function scanner_table_columns( $table ) {
+		$table = (string) $table;
+		if ( '' === $table || ! $this->database ) {
+			return [];
+		}
+
+		if ( array_key_exists( $table, $this->table_column_cache ) ) {
+			return $this->table_column_cache[ $table ];
+		}
+
+		$this->table_column_cache[ $table ] = $this->database->get_results(
+			'SHOW COLUMNS FROM ' . $this->quote_identifier( $table ),
+			true
+		);
+
+		return $this->table_column_cache[ $table ];
+	}
+
+	/**
+	 * Build a bounded custom-table scan definition from SHOW COLUMNS metadata.
+	 */
+	private function deep_database_table_definition( $table ) {
+		$db = $this->database;
+		if ( ! $db ) {
+			return [];
+		}
+
+		$columns = $this->scanner_table_columns( $table );
+		$text_fields = [];
+		$primary_fields = [];
+		$primary_types = [];
+		foreach ( $columns as $column ) {
+			$field = (string) ( $column['Field'] ?? '' );
+			$type = strtolower( (string) ( $column['Type'] ?? '' ) );
+			if ( '' === $field ) {
+				continue;
+			}
+			if ( 'PRI' === strtoupper( (string) ( $column['Key'] ?? '' ) ) ) {
+				$primary_fields[] = $field;
+				$primary_types[ $field ] = $type;
+			}
+			if ( preg_match( '/^(?:var)?char\b|^(?:tiny|medium|long)?text\b|^json\b|^enum\b|^set\b/i', $type ) ) {
+				$text_fields[] = $field;
+			}
+		}
+
+		$pk = 1 === count( $primary_fields ) ? $primary_fields[0] : '';
+		$pk_type = '' !== $pk ? ( $primary_types[ $pk ] ?? '' ) : '';
+		return [
+			'table'      => $table,
+			'pk'         => $pk,
+			'pk_numeric' => '' !== $pk && (bool) preg_match( '/^(?:tinyint|smallint|mediumint|int|integer|bigint)\b/i', $pk_type ),
+			'fields'     => array_values( array_unique( $text_fields ) ),
+		];
+	}
+
+	/**
+	 * Scan one custom table. A simple primary key uses keyset pagination when it
+	 * is numeric; other schemas use bounded LIMIT/OFFSET so tables without a
+	 * conventional integer ID are still covered in explicit deep mode.
+	 */
+	private function scan_deep_database_table( $stage, array $definition ) {
+		$db = $this->database;
+		if ( ! $db ) {
+			return 0;
+		}
+
+		$table = (string) $definition['table'];
+		$pk = (string) ( $definition['pk'] ?? '' );
+		$pk_numeric = ! empty( $definition['pk_numeric'] );
+		$fields = array_values( array_unique( $definition['fields'] ?? [] ) );
+		if ( empty( $fields ) ) {
+			return 0;
+		}
+
+		$columns = $fields;
+		if ( '' !== $pk ) {
+			array_unshift( $columns, $pk );
+		}
+		$select = implode( ', ', array_map( [ $this, 'quote_identifier' ], array_values( array_unique( $columns ) ) ) );
+		$offset = 0;
+		$last_id = 0;
+		$count = 0;
+
+		while ( true ) {
+			if ( $pk_numeric ) {
+				$sql = sprintf(
+					'SELECT %s FROM %s WHERE %s > %%d ORDER BY %s ASC LIMIT %d',
+					$select,
+					$this->quote_identifier( $table ),
+					$this->quote_identifier( $pk ),
+					$this->quote_identifier( $pk ),
+					self::DB_BATCH_SIZE
+				);
+				$rows = $db->get_results( $db->prepare( $sql, $last_id ), true );
+			} else {
+				$sql = sprintf(
+					'SELECT %s FROM %s LIMIT %d OFFSET %d',
+					$select,
+					$this->quote_identifier( $table ),
+					self::DB_BATCH_SIZE,
+					$offset
+				);
+				$rows = $db->get_results( $sql, true );
+			}
+
+			if ( empty( $rows ) ) {
+				break;
+			}
+
+			foreach ( $rows as $index => $row ) {
+				$count++;
+				$this->scanned_db_rows++;
+				$location_pk = $pk;
+				if ( $pk_numeric ) {
+					$last_id = max( $last_id, (int) ( $row[ $pk ] ?? 0 ) );
+				} elseif ( '' === $location_pk ) {
+					$location_pk = '__rownum';
+					$row[ $location_pk ] = $offset + $index + 1;
+				}
+
+				foreach ( $fields as $field ) {
+					$value = isset( $row[ $field ] ) ? (string) $row[ $field ] : '';
+					if ( '' === $value ) {
+						continue;
+					}
+					$this->scan_database_value( $stage, $table, $location_pk, $row, $field, $value, [] );
+				}
+				$this->stage_tick( $stage, $count, 'rows' );
+			}
+
+			if ( ! $pk_numeric ) {
+				$offset += count( $rows );
+			}
+			if ( count( $rows ) < self::DB_BATCH_SIZE ) {
+				break;
+			}
+		}
+
+		return $count;
 	}
 
 	/**
@@ -3669,6 +4319,7 @@ class Security_Scan_Command {
 			$role_definitions = $this->read_role_definitions();
 			$super_admin_logins = $this->read_multisite_super_admin_logins();
 			$recent_cutoff = strtotime( '-' . self::RECENT_USER_MONTHS . ' months', time() );
+			$this->scan_role_capability_persistence( $stage, $role_definitions );
 			$last_user_id = 0;
 
 			while ( true ) {
@@ -3699,6 +4350,7 @@ class Security_Scan_Command {
 				}
 
 				$capability_map = $this->read_user_capability_map_for_ids( $user_ids );
+				$application_password_map = $this->read_user_application_password_map_for_ids( $user_ids );
 
 				foreach ( $user_rows as $row ) {
 					$user_id = (int) ( $row['ID'] ?? 0 );
@@ -3710,9 +4362,19 @@ class Security_Scan_Command {
 					$user_caps = $capability_map[ $user_id ] ?? [];
 					$user_state = $this->resolve_user_security_state( $user_caps, $role_definitions );
 					$user_login = (string) ( $row['user_login'] ?? '' );
-					if ( isset( $super_admin_logins[ $user_login ] ) ) {
+					$is_super_admin = isset( $super_admin_logins[ $user_login ] );
+					if ( $is_super_admin ) {
 						$user_state['is_privileged'] = true;
 					}
+
+					$this->scan_user_direct_capability_persistence( $stage, $row, $user_state, $is_super_admin );
+					$this->scan_user_application_password_persistence(
+						$stage,
+						$row,
+						$user_state,
+						$application_password_map[ $user_id ] ?? [],
+						$recent_cutoff
+					);
 
 					if ( in_array( 'administrator', $user_state['roles'], true ) ) {
 						$admin_count++;
@@ -3775,6 +4437,7 @@ class Security_Scan_Command {
 				$this->stage_tick( $stage, $count, 'items' );
 			}
 
+			$this->scan_action_scheduler_persistence( $stage, $count );
 			$this->stage_finish( $stage, $count, $this->count_stage_findings( $stage ), 'items' );
 		} catch ( \Throwable $e ) {
 			$this->clear_spinner();
@@ -3825,12 +4488,176 @@ class Security_Scan_Command {
 		return $map;
 	}
 
+
+	/**
+	 * Read application-password metadata for one bounded user batch.
+	 *
+	 * WordPress stores these records in the `_application_passwords` user meta
+	 * key. Values are decoded through the scanner's object-safe bounded decoder;
+	 * password hashes are never included in findings or logs.
+	 */
+	private function read_user_application_password_map_for_ids( array $user_ids ) {
+		$db = $this->database;
+		if ( ! $db || empty( $user_ids ) || ! $db->table_exists( $db->usermeta ) ) {
+			return [];
+		}
+
+		$user_ids = array_values( array_unique( array_filter( array_map( 'intval', $user_ids ) ) ) );
+		if ( empty( $user_ids ) ) {
+			return [];
+		}
+
+		$sql = $db->prepare(
+			'SELECT user_id, meta_value FROM ' . $this->quote_identifier( $db->usermeta ) . ' WHERE meta_key = %s AND user_id IN (' . implode( ',', $user_ids ) . ')',
+			self::APPLICATION_PASSWORD_META_KEY
+		);
+		$rows = $db->get_results( $sql, true );
+		$map = [];
+
+		foreach ( $rows as $row ) {
+			$user_id = (int) ( $row['user_id'] ?? 0 );
+			$decoded = $this->decode_stored_value( (string) ( $row['meta_value'] ?? '' ) );
+			if ( $user_id < 1 || ! is_array( $decoded ) ) {
+				continue;
+			}
+			$map[ $user_id ] = $decoded;
+		}
+
+		return $map;
+	}
+
+	/**
+	 * Flag role definitions that grant core administrative capabilities outside
+	 * the normal administrator role.
+	 *
+	 * Custom roles can legitimately be powerful, so they remain MEDIUM. Changes
+	 * to WordPress's built-in non-administrator roles are stronger persistence
+	 * evidence because those roles do not normally carry these capabilities.
+	 */
+	private function scan_role_capability_persistence( $stage, array $role_definitions ) {
+		foreach ( $role_definitions as $role => $capabilities ) {
+			if ( 'administrator' === $role || ! is_array( $capabilities ) ) {
+				continue;
+			}
+
+			$granted = [];
+			foreach ( self::ADMINISTRATIVE_CAPABILITIES as $capability ) {
+				if ( ! empty( $capabilities[ $capability ] ) ) {
+					$granted[] = $capability;
+				}
+			}
+
+			if ( empty( $granted ) ) {
+				continue;
+			}
+
+			$is_builtin = in_array( $role, self::BUILTIN_NON_ADMIN_ROLES, true );
+			$this->add_finding(
+				$stage,
+				$is_builtin ? 'high' : 'medium',
+				$is_builtin ? 92 : 82,
+				'role: ' . $this->single_line_log_value( $role ) . ' · capabilities: ' . implode( ', ', $granted ),
+				$is_builtin ? 'builtin_role_admin_capabilities' : 'custom_role_admin_capabilities',
+				$is_builtin
+					? 'Built-in non-administrator role grants administrative capabilities'
+					: 'Custom role grants administrative capabilities'
+			);
+		}
+	}
+
+	/**
+	 * Flag direct user capability grants that bypass the user's assigned roles.
+	 */
+	private function scan_user_direct_capability_persistence( $stage, array $row, array $user_state, $is_super_admin ) {
+		if ( $is_super_admin || in_array( 'administrator', $user_state['roles'] ?? [], true ) ) {
+			return;
+		}
+
+		$direct = array_values( array_intersect( $user_state['direct_capabilities'] ?? [], self::ADMINISTRATIVE_CAPABILITIES ) );
+		if ( empty( $direct ) ) {
+			return;
+		}
+
+		sort( $direct, SORT_STRING );
+		$user_id = (int) ( $row['ID'] ?? 0 );
+		$user_login = $this->single_line_log_value( (string) ( $row['user_login'] ?? '' ) );
+		$this->add_finding(
+			$stage,
+			'medium',
+			84,
+			sprintf( 'user #%d · %s · direct capabilities: %s', $user_id, $user_login, implode( ', ', $direct ) ),
+			'user_direct_admin_capabilities',
+			'User has direct administrative capabilities outside assigned roles'
+		);
+	}
+
+	/**
+	 * Flag recently created application passwords on privileged accounts.
+	 *
+	 * Application passwords are a legitimate WordPress authentication mechanism,
+	 * so their presence alone is not suspicious. Recent credentials on a
+	 * privileged account are useful incident-response persistence evidence and
+	 * are reported for manual review without exposing the stored password hash.
+	 */
+	private function scan_user_application_password_persistence( $stage, array $row, array $user_state, array $passwords, $recent_cutoff ) {
+		if ( empty( $user_state['is_privileged'] ) || empty( $passwords ) ) {
+			return;
+		}
+
+		foreach ( $passwords as $password ) {
+			if ( ! is_array( $password ) ) {
+				continue;
+			}
+
+			$created = isset( $password['created'] ) ? (int) $password['created'] : 0;
+			if ( $created < 1 || $created < $recent_cutoff ) {
+				continue;
+			}
+
+			$name = $this->single_line_log_value( (string) ( $password['name'] ?? 'unnamed' ) );
+			$last_used = isset( $password['last_used'] ) ? (int) $password['last_used'] : 0;
+			$last_ip = $this->single_line_log_value( (string) ( $password['last_ip'] ?? '' ) );
+			$details = sprintf(
+				'user #%d · %s · application password: %s · created %s UTC',
+				(int) ( $row['ID'] ?? 0 ),
+				$this->single_line_log_value( (string) ( $row['user_login'] ?? '' ) ),
+				$name,
+				gmdate( 'Y-m-d H:i:s', $created )
+			);
+			if ( $last_used > 0 ) {
+				$details .= ' · last used ' . gmdate( 'Y-m-d H:i:s', $last_used ) . ' UTC';
+			}
+			if ( '' !== $last_ip ) {
+				$details .= ' · last IP: ' . $last_ip;
+			}
+
+			$this->add_finding(
+				$stage,
+				'high',
+				90,
+				$details,
+				'recent_privileged_application_password',
+				'Privileged user has a recently created application password'
+			);
+		}
+	}
+
+	/**
+	 * Keep attacker-controlled labels from creating extra lines in reports.
+	 */
+	private function single_line_log_value( $value ) {
+		$value = preg_replace( '/[\x00-\x1F\x7F]+/', ' ', (string) $value );
+		$value = preg_replace( '/\s+/', ' ', (string) $value );
+		return trim( (string) $value );
+	}
+
 	/**
 	 * Resolve roles and effective capabilities without loading WP_User.
 	 */
 	private function resolve_user_security_state( array $user_caps, array $role_definitions ) {
 		$roles = [];
 		$effective_caps = [];
+		$direct_caps = [];
 
 		foreach ( $user_caps as $capability => $enabled ) {
 			if ( ! $enabled ) {
@@ -3846,16 +4673,23 @@ class Security_Scan_Command {
 				}
 			} else {
 				$effective_caps[ $capability ] = true;
+				$direct_caps[ $capability ] = true;
 			}
 		}
 
 		$roles = array_values( array_unique( $roles ) );
+		$is_privileged = isset( $effective_caps['edit_others_posts'] ) || isset( $effective_caps['manage_woocommerce'] );
+		foreach ( self::ADMINISTRATIVE_CAPABILITIES as $capability ) {
+			if ( isset( $effective_caps[ $capability ] ) ) {
+				$is_privileged = true;
+				break;
+			}
+		}
+
 		return [
-			'roles'         => $roles,
-			'is_privileged' => isset( $effective_caps['manage_options'] )
-				|| isset( $effective_caps['edit_others_posts'] )
-				|| isset( $effective_caps['manage_woocommerce'] )
-				|| in_array( 'administrator', $roles, true ),
+			'roles'               => $roles,
+			'direct_capabilities' => array_keys( $direct_caps ),
+			'is_privileged'       => $is_privileged || in_array( 'administrator', $roles, true ),
 		];
 	}
 
@@ -3913,23 +4747,15 @@ class Security_Scan_Command {
 	 * historical imports/migrations do not dominate an incident report.
 	 */
 	private function scan_recent_and_burst_users( $stage, array $users ) {
-		$recent_cutoff = strtotime( '-' . self::RECENT_USER_MONTHS . ' months', time() );
-		$recent_users = array_values(
-			array_filter(
-				$users,
-				static function ( $user ) use ( $recent_cutoff ) {
-					return $user['timestamp'] >= $recent_cutoff;
-				}
-			)
-		);
-
-		if ( empty( $recent_users ) ) {
+		if ( empty( $users ) ) {
 			return;
 		}
 
-		$burst_members = $this->find_user_burst_members( $recent_users );
+		// The caller already retains only users inside the configured recent window.
+		// Avoid filtering and timestamp work a second time before burst analysis.
+		$burst_members = $this->find_user_burst_members( $users );
 
-		foreach ( $recent_users as $user ) {
+		foreach ( $users as $user ) {
 			$location = $this->format_user_location( $user );
 
 			if ( isset( $burst_members[ $user['id'] ] ) ) {
@@ -4035,6 +4861,99 @@ class Security_Scan_Command {
 			$roles,
 			$user['registered']
 		);
+	}
+
+
+	/**
+	 * Inspect active Action Scheduler jobs for the same strong persistence
+	 * indicators used for WP-Cron.
+	 *
+	 * Action Scheduler is widely used by legitimate plugins, so hook names and
+	 * arguments are not suspicious by themselves. Only existing IOC/database
+	 * persistence rules can create findings here.
+	 */
+	private function scan_action_scheduler_persistence( $stage, &$count ) {
+		$db = $this->database;
+		if ( ! $db ) {
+			return;
+		}
+
+		$table = $this->site_table_prefix . 'actionscheduler_actions';
+		if ( ! $db->table_exists( $table ) ) {
+			return;
+		}
+
+		$column_rows = $this->scanner_table_columns( $table );
+		$columns = [];
+		foreach ( $column_rows as $column ) {
+			$field = (string) ( $column['Field'] ?? '' );
+			if ( '' !== $field ) {
+				$columns[ $field ] = true;
+			}
+		}
+
+		foreach ( [ 'action_id', 'hook', 'args' ] as $required ) {
+			if ( ! isset( $columns[ $required ] ) ) {
+				return;
+			}
+		}
+
+		$selected = [ 'action_id', 'hook', 'args' ];
+		foreach ( [ 'status', 'scheduled_date_gmt', 'extended_args' ] as $optional ) {
+			if ( isset( $columns[ $optional ] ) ) {
+				$selected[] = $optional;
+			}
+		}
+		$select = implode( ', ', array_map( [ $this, 'quote_identifier' ], $selected ) );
+		$last_id = 0;
+
+		while ( true ) {
+			$where = $this->quote_identifier( 'action_id' ) . ' > %d';
+			if ( isset( $columns['status'] ) ) {
+				$where .= " AND " . $this->quote_identifier( 'status' ) . " IN ('pending','in-progress')";
+			}
+			$sql = sprintf(
+				'SELECT %s FROM %s WHERE %s ORDER BY %s ASC LIMIT %d',
+				$select,
+				$this->quote_identifier( $table ),
+				$where,
+				$this->quote_identifier( 'action_id' ),
+				self::DB_BATCH_SIZE
+			);
+			$rows = $db->get_results( $db->prepare( $sql, $last_id ), true );
+			if ( empty( $rows ) ) {
+				break;
+			}
+
+			foreach ( $rows as $row ) {
+				$action_id = (int) ( $row['action_id'] ?? 0 );
+				if ( $action_id < 1 ) {
+					continue;
+				}
+				$last_id = max( $last_id, $action_id );
+				$count++;
+				$this->scanned_db_rows++;
+
+				$hook = $this->single_line_log_value( (string) ( $row['hook'] ?? '' ) );
+				$status = $this->single_line_log_value( (string) ( $row['status'] ?? '' ) );
+				$scheduled = $this->single_line_log_value( (string) ( $row['scheduled_date_gmt'] ?? '' ) );
+				$location = sprintf( 'Action Scheduler #%d · hook: %s', $action_id, $hook );
+				if ( '' !== $status ) {
+					$location .= ' · status: ' . $status;
+				}
+				if ( '' !== $scheduled && '0000-00-00 00:00:00' !== $scheduled ) {
+					$location .= ' · scheduled ' . $scheduled . ' UTC';
+				}
+
+				$value = (string) ( $row['hook'] ?? '' ) . ' ' . (string) ( $row['args'] ?? '' ) . ' ' . (string) ( $row['extended_args'] ?? '' );
+				$this->scan_persistence_value( $stage, $location, $value );
+				$this->stage_tick( $stage, $count, 'items' );
+			}
+
+			if ( count( $rows ) < self::DB_BATCH_SIZE ) {
+				break;
+			}
+		}
 	}
 
 	/**
@@ -4339,7 +5258,6 @@ PHP;
 
 		usort( $filtered, [ $this, 'sort_findings' ] );
 
-		$this->modification_clusters = $this->build_finding_mtime_clusters( $filtered );
 		$report = $this->build_report( $filtered );
 		$scan_log_path = $this->write_scan_log( $report );
 		$output_file = isset( $assoc_args['output'] ) ? (string) $assoc_args['output'] : '';
@@ -4390,6 +5308,7 @@ PHP;
 			'total_findings'    => count( $findings ),
 			'stages'            => $report_stages,
 			'findings'          => $findings,
+			'correlations'      => $this->build_cross_layer_indicator_correlations( $findings ),
 		];
 	}
 
@@ -4517,18 +5436,6 @@ PHP;
 
 		$extension = strtolower( pathinfo( (string) $finding['location'], PATHINFO_EXTENSION ) );
 		return in_array( $extension, array_merge( self::PHP_EXTENSIONS, [ 'js', 'mjs', 'cjs' ] ), true );
-	}
-
-	/**
-	 * Weighted risk score used only when trusted checksums are unavailable.
-	 */
-	private function plugin_risk_score( array $findings ) {
-		$score = 0;
-		foreach ( $findings as $finding ) {
-			$score += (int) ( self::SEVERITY_WEIGHT[ $finding['severity'] ] ?? 0 );
-		}
-
-		return $score;
 	}
 
 	/**
@@ -4691,21 +5598,6 @@ PHP;
 	}
 
 	/**
-	 * Format per-plugin severity counts.
-	 */
-	private function plugin_severity_summary( array $group ) {
-		$parts = [];
-		foreach ( [ 'critical', 'high', 'medium', 'low' ] as $severity ) {
-			$count = (int) ( $group['severity'][ $severity ] ?? 0 );
-			if ( $count > 0 ) {
-				$parts[] = $count . ' ' . $severity;
-			}
-		}
-
-		return implode( ' · ', $parts );
-	}
-
-	/**
 	 * Count checksum changes recorded for a plugin.
 	 */
 	private function plugin_integrity_change_count( $plugin ) {
@@ -4738,15 +5630,25 @@ PHP;
 					$location .= '/' . $file;
 				}
 
-				$groups[ $problem ][] = $location;
+				if ( ! isset( $groups[ $problem ] ) ) {
+					$groups[ $problem ] = [
+						'plugins' => [],
+						'files'   => [],
+					];
+				}
+				$groups[ $problem ]['plugins'][ $slug ] = true;
+				$groups[ $problem ]['files'][ $location ] = true;
 			}
 		}
 
 		ksort( $groups, SORT_STRING );
-		foreach ( $groups as &$locations ) {
-			sort( $locations, SORT_STRING );
+		foreach ( $groups as &$group ) {
+			$group['plugins'] = array_keys( $group['plugins'] );
+			$group['files'] = array_keys( $group['files'] );
+			sort( $group['plugins'], SORT_STRING );
+			sort( $group['files'], SORT_STRING );
 		}
-		unset( $locations );
+		unset( $group );
 
 		return $groups;
 	}
@@ -4766,6 +5668,92 @@ PHP;
 		return $slugs;
 	}
 
+
+
+	/**
+	 * Correlate exact known indicators that appear in more than one scan layer.
+	 *
+	 * Correlation is contextual evidence only: it does not create extra findings
+	 * or alter severity counters. Restricting this to exact IOC rules keeps the
+	 * signal strong and avoids correlating broad heuristics across unrelated code.
+	 */
+	private function build_cross_layer_indicator_correlations( array $findings ) {
+		$groups = [];
+
+		foreach ( $findings as $finding ) {
+			$rule = (string) ( $finding['rule'] ?? '' );
+			if ( 0 !== strpos( $rule, 'ioc_' ) ) {
+				continue;
+			}
+
+			$section = (string) ( $finding['section'] ?? '' );
+			if ( '' === $section ) {
+				continue;
+			}
+
+			if ( ! isset( $groups[ $rule ] ) ) {
+				$groups[ $rule ] = [
+					'rule'        => $rule,
+					'description' => (string) ( $finding['description'] ?? 'Known security indicator' ),
+					'severity'    => (string) ( $finding['severity'] ?? 'high' ),
+					'confidence'  => (int) ( $finding['confidence'] ?? 0 ),
+					'sections'    => [],
+					'locations'   => [],
+				];
+			}
+
+			$groups[ $rule ]['sections'][ $section ] = true;
+			$location = $this->finding_location( $finding );
+			$groups[ $rule ]['locations'][ $section . "\0" . $location ] = [
+				'section'  => $section,
+				'location' => $location,
+			];
+
+			if (
+				self::SEVERITY_WEIGHT[ $finding['severity'] ] > self::SEVERITY_WEIGHT[ $groups[ $rule ]['severity'] ]
+				|| (
+					$finding['severity'] === $groups[ $rule ]['severity']
+					&& (int) $finding['confidence'] > (int) $groups[ $rule ]['confidence']
+				)
+			) {
+				$groups[ $rule ]['severity'] = (string) $finding['severity'];
+				$groups[ $rule ]['confidence'] = (int) $finding['confidence'];
+			}
+		}
+
+		$correlations = [];
+		foreach ( $groups as $group ) {
+			if ( count( $group['sections'] ) < 2 ) {
+				continue;
+			}
+
+			$group['sections'] = array_keys( $group['sections'] );
+			sort( $group['sections'], SORT_STRING );
+			$group['locations'] = array_values( $group['locations'] );
+			usort(
+				$group['locations'],
+				static function ( $a, $b ) {
+					$section_compare = strcmp( $a['section'], $b['section'] );
+					return 0 !== $section_compare ? $section_compare : strcmp( $a['location'], $b['location'] );
+				}
+			);
+			$correlations[] = $group;
+		}
+
+		usort(
+			$correlations,
+			function ( $a, $b ) {
+				$severity_compare = self::SEVERITY_WEIGHT[ $b['severity'] ] <=> self::SEVERITY_WEIGHT[ $a['severity'] ];
+				if ( 0 !== $severity_compare ) {
+					return $severity_compare;
+				}
+				$confidence_compare = (int) $b['confidence'] <=> (int) $a['confidence'];
+				return 0 !== $confidence_compare ? $confidence_compare : strcmp( $a['description'], $b['description'] );
+			}
+		);
+
+		return $correlations;
+	}
 
 	/**
 	 * Group findings by their human-readable problem while preserving locations.
@@ -4987,6 +5975,56 @@ PHP;
 		return $recommendations;
 	}
 
+
+	/**
+	 * Group plugin recommendations by the user-facing action and reason.
+	 *
+	 * Internal plugin scores remain per-plugin, but the final remediation report
+	 * should present one concise instruction for every equivalent recommendation.
+	 */
+	private function group_plugin_recommendations( array $recommendations ) {
+		$groups = [];
+		foreach ( $recommendations as $recommendation ) {
+			$action = (string) ( $recommendation['action'] ?? 'review' );
+			$reason = trim( (string) ( $recommendation['reason'] ?? '' ) );
+			$slug = trim( (string) ( $recommendation['slug'] ?? '' ) );
+			if ( '' === $slug || '' === $reason ) {
+				continue;
+			}
+
+			$key = $action . "\0" . $reason;
+			if ( ! isset( $groups[ $key ] ) ) {
+				$groups[ $key ] = [
+					'action' => $action,
+					'reason' => $reason,
+					'slugs'  => [],
+				];
+			}
+			$groups[ $key ]['slugs'][ $slug ] = true;
+		}
+
+		$groups = array_values( $groups );
+		foreach ( $groups as &$group ) {
+			$group['slugs'] = array_keys( $group['slugs'] );
+			sort( $group['slugs'], SORT_STRING );
+		}
+		unset( $group );
+
+		usort(
+			$groups,
+			static function ( $a, $b ) {
+				$rank = [ 'reinstall' => 2, 'review' => 1 ];
+				$action_compare = ( $rank[ $b['action'] ] ?? 0 ) <=> ( $rank[ $a['action'] ] ?? 0 );
+				if ( 0 !== $action_compare ) {
+					return $action_compare;
+				}
+				return strcmp( $a['reason'], $b['reason'] );
+			}
+		);
+
+		return $groups;
+	}
+
 	/**
 	 * Render remediation recommendations grouped by reason and priority.
 	 */
@@ -4999,47 +6037,18 @@ PHP;
 			return;
 		}
 
-		$buckets = [
-			'integrity' => [],
-			'risk_reinstall' => [],
-			'review'    => [],
-		];
-		foreach ( $recommendations as $recommendation ) {
-			if ( 'Plugin files do not match the official package.' === $recommendation['reason'] ) {
-				$buckets['integrity'][] = $recommendation['slug'];
-			} elseif ( 'reinstall' === $recommendation['action'] ) {
-				$buckets['risk_reinstall'][] = $recommendation['slug'];
-			} else {
-				$buckets['review'][] = $recommendation['slug'];
-			}
-		}
-
 		\WP_CLI::log( '' );
 		\WP_CLI::log( 'Recommendations' );
 		\WP_CLI::log( str_repeat( '-', 50 ) );
 
-		if ( ! empty( $buckets['integrity'] ) ) {
-			\WP_CLI::log( 'HIGH PRIORITY — Plugin files do not match the official package' );
-			foreach ( $buckets['integrity'] as $slug ) {
+		foreach ( $this->group_plugin_recommendations( $recommendations ) as $recommendation_group ) {
+			$prefix = 'reinstall' === $recommendation_group['action'] ? 'HIGH PRIORITY' : 'REVIEW';
+			\WP_CLI::log( $prefix . ' — ' . rtrim( $recommendation_group['reason'], '.' ) );
+			foreach ( $recommendation_group['slugs'] as $slug ) {
 				\WP_CLI::log( '  ⚠ ' . $slug );
 			}
-			\WP_CLI::log( '  Replace these plugins with fresh trusted copies, then rescan.' );
-			\WP_CLI::log( '' );
-		}
-
-		if ( ! empty( $buckets['risk_reinstall'] ) ) {
-			\WP_CLI::log( 'HIGH PRIORITY — Multiple high-risk findings detected' );
-			foreach ( $buckets['risk_reinstall'] as $slug ) {
-				\WP_CLI::log( '  ⚠ ' . $slug );
-			}
-			\WP_CLI::log( '  Replace these plugins with fresh trusted copies, then rescan.' );
-			\WP_CLI::log( '' );
-		}
-
-		if ( ! empty( $buckets['review'] ) ) {
-			\WP_CLI::log( 'REVIEW — Suspicious plugin findings' );
-			foreach ( $buckets['review'] as $slug ) {
-				\WP_CLI::log( '  ⚠ ' . $slug );
+			if ( 'reinstall' === $recommendation_group['action'] ) {
+				\WP_CLI::log( '  Replace these plugins with fresh trusted copies, then rescan.' );
 			}
 			\WP_CLI::log( '' );
 		}
@@ -5074,46 +6083,21 @@ PHP;
 			return [];
 		}
 
-		$buckets = [ 'integrity' => [], 'risk_reinstall' => [], 'review' => [] ];
-		foreach ( $recommendations as $recommendation ) {
-			if ( 'Plugin files do not match the official package.' === $recommendation['reason'] ) {
-				$buckets['integrity'][] = $recommendation['slug'];
-			} elseif ( 'reinstall' === $recommendation['action'] ) {
-				$buckets['risk_reinstall'][] = $recommendation['slug'];
-			} else {
-				$buckets['review'][] = $recommendation['slug'];
+		$lines = [ '## Recommendations', '' ];
+		foreach ( $this->group_plugin_recommendations( $recommendations ) as $recommendation_group ) {
+			$prefix = 'reinstall' === $recommendation_group['action'] ? 'High priority' : 'Review';
+			$lines[] = '### ' . $prefix . ' — ' . rtrim( $recommendation_group['reason'], '.' );
+			$lines[] = '';
+			foreach ( $recommendation_group['slugs'] as $slug ) {
+				$lines[] = '- ⚠ `' . $this->markdown_escape( $slug ) . '`';
+			}
+			$lines[] = '';
+			if ( 'reinstall' === $recommendation_group['action'] ) {
+				$lines[] = 'Replace these plugins with fresh trusted copies, then rescan.';
+				$lines[] = '';
 			}
 		}
 
-		$lines = [ '## Recommendations', '' ];
-		if ( ! empty( $buckets['integrity'] ) ) {
-			$lines[] = '### High priority — Plugin files do not match the official package';
-			$lines[] = '';
-			foreach ( $buckets['integrity'] as $slug ) {
-				$lines[] = '- ⚠ `' . $this->markdown_escape( $slug ) . '`';
-			}
-			$lines[] = '';
-			$lines[] = 'Replace these plugins with fresh trusted copies, then rescan.';
-			$lines[] = '';
-		}
-		if ( ! empty( $buckets['risk_reinstall'] ) ) {
-			$lines[] = '### High priority — Multiple high-risk findings detected';
-			$lines[] = '';
-			foreach ( $buckets['risk_reinstall'] as $slug ) {
-				$lines[] = '- ⚠ `' . $this->markdown_escape( $slug ) . '`';
-			}
-			$lines[] = '';
-			$lines[] = 'Replace these plugins with fresh trusted copies, then rescan.';
-			$lines[] = '';
-		}
-		if ( ! empty( $buckets['review'] ) ) {
-			$lines[] = '### Review — Suspicious plugin findings';
-			$lines[] = '';
-			foreach ( $buckets['review'] as $slug ) {
-				$lines[] = '- ⚠ `' . $this->markdown_escape( $slug ) . '`';
-			}
-			$lines[] = '';
-		}
 		if ( $has_inactive_plugins || $has_inactive_themes ) {
 			$lines[] = $this->full_scan ? '### Cleanup — Inactive code' : '### Cleanup — Inactive code is not scanned';
 			$lines[] = '';
@@ -5418,6 +6402,26 @@ PHP;
 			$lines = array_merge( $lines, $this->render_markdown_grouped_findings( $findings ) );
 		}
 
+		if ( ! empty( $report['correlations'] ) ) {
+			$lines[] = '## Correlated indicators';
+			$lines[] = '';
+			foreach ( $report['correlations'] as $correlation ) {
+				$lines[] = sprintf(
+					'### %s — %d%% confidence',
+					strtoupper( (string) $correlation['severity'] ),
+					(int) $correlation['confidence']
+				);
+				$lines[] = '';
+				$lines[] = '- Indicator: ' . $this->markdown_escape( (string) $correlation['description'] );
+				$lines[] = '- Seen in: ' . $this->markdown_escape( implode( ', ', $correlation['sections'] ) );
+				$lines[] = '- Locations:';
+				foreach ( $correlation['locations'] as $location ) {
+					$lines[] = '  - [' . $this->markdown_escape( $location['section'] ) . '] `' . $this->markdown_escape( $location['location'] ) . '`';
+				}
+				$lines[] = '';
+			}
+		}
+
 		$plugin_findings = array_values(
 			array_filter(
 				$report['findings'],
@@ -5477,31 +6481,92 @@ PHP;
 	}
 
 	/**
+	 * Render the scan timestamp in the site's local timezone without loading WordPress.
+	 *
+	 * WordPress stores either an IANA timezone in timezone_string or a numeric
+	 * gmt_offset. The PHP/process timezone is used only when neither site setting
+	 * can be resolved safely.
+	 */
+	private function resolve_scan_log_timestamp( $timestamp ) {
+		try {
+			$instant = new \DateTimeImmutable( (string) $timestamp, new \DateTimeZone( 'UTC' ) );
+		} catch ( \Exception $exception ) {
+			$instant = new \DateTimeImmutable( 'now', new \DateTimeZone( 'UTC' ) );
+		}
+
+		$timezone = $this->resolve_site_timezone();
+		return $instant->setTimezone( $timezone )->format( 'c' );
+	}
+
+	/**
+	 * Resolve the site's configured timezone without WordPress date/time APIs.
+	 */
+	private function resolve_site_timezone() {
+		$timezone_string = $this->scanner_get_option( 'timezone_string', '' );
+		if ( is_string( $timezone_string ) && '' !== trim( $timezone_string ) ) {
+			try {
+				return new \DateTimeZone( trim( $timezone_string ) );
+			} catch ( \Exception $exception ) {
+				// Fall through to the numeric offset/process timezone fallback.
+			}
+		}
+
+		$gmt_offset = $this->scanner_get_option( 'gmt_offset', null );
+		if ( is_numeric( $gmt_offset ) ) {
+			$offset = (float) $gmt_offset;
+			if ( $offset >= -14.0 && $offset <= 14.0 ) {
+				$minutes = (int) round( abs( $offset ) * 60 );
+				$sign = $offset < 0 ? '-' : '+';
+				$name = sprintf( '%s%02d:%02d', $sign, intdiv( $minutes, 60 ), $minutes % 60 );
+				try {
+					return new \DateTimeZone( $name );
+				} catch ( \Exception $exception ) {
+					// Fall through to the process timezone.
+				}
+			}
+		}
+
+		try {
+			return new \DateTimeZone( date_default_timezone_get() );
+		} catch ( \Exception $exception ) {
+			return new \DateTimeZone( 'UTC' );
+		}
+	}
+
+	/**
+	 * Build a stable display list for inactive plugins/themes in cleanup guidance.
+	 */
+	private function inactive_code_display_list( array $items ) {
+		$labels = [];
+		foreach ( $items as $item ) {
+			$slug = trim( (string) ( $item['slug'] ?? '' ) );
+			$name = trim( (string) ( $item['name'] ?? '' ) );
+			if ( '' === $slug && '' === $name ) {
+				continue;
+			}
+
+			$label = '' !== $name ? $name : $slug;
+			if ( '' !== $slug && $slug !== $label ) {
+				$label .= ' (' . $slug . ')';
+			}
+			$labels[ $label ] = true;
+		}
+
+		$labels = array_keys( $labels );
+		sort( $labels, SORT_NATURAL | SORT_FLAG_CASE );
+		return $labels;
+	}
+
+	/**
 	 * Build a detailed plain-text report intended for manual incident review.
 	 */
 	private function render_scan_log( array $report ) {
 		$lines = [];
-		$lines[] = str_repeat( '-', 80 );
-		$lines[] = 'WORDPRESS SECURITY SCAN';
-		$lines[] = str_repeat( '-', 80 );
-		$lines[] = sprintf( '%-16s %s', 'Scanned at:', ( $report['scanned_at'] ?? gmdate( 'c' ) ) );
-		$this->append_scan_log_major_section_gap( $lines );
-		$lines[] = 'SUMMARY';
-		$lines[] = str_repeat( '-', 80 );
-		$lines[] = 'Severity';
-		$lines[] = sprintf( '  %-14s %s', 'CRITICAL', number_format( (int) $report['severity']['critical'] ) );
-		$lines[] = sprintf( '  %-14s %s', 'HIGH', number_format( (int) $report['severity']['high'] ) );
-		$lines[] = sprintf( '  %-14s %s', 'MEDIUM', number_format( (int) $report['severity']['medium'] ) );
-		$lines[] = sprintf( '  %-14s %s', 'LOW', number_format( (int) $report['severity']['low'] ) );
-		$lines[] = '';
-		$lines[] = 'Scope';
-		$lines[] = sprintf( '  %-22s %s', 'Files scanned', number_format( (int) $report['files_scanned'] ) );
-		$lines[] = sprintf( '  %-22s %s', 'Database rows scanned', number_format( (int) $report['database_rows'] ) );
-		$lines[] = sprintf( '  %-22s %s', 'Administrator users', number_format( (int) $report['administrator_users'] ) );
-		$lines[] = sprintf( '  %-22s %s', 'Reportable findings', number_format( (int) $report['total_findings'] ) );
+		$lines[] = 'WORDPRESS SECURITY SCAN:      ' . $this->resolve_scan_log_timestamp( $report['scanned_at'] ?? gmdate( 'c' ) );
+		$lines[] = str_repeat( '-', self::SCAN_LOG_SEPARATOR_WIDTH );
 		$this->append_scan_log_major_section_gap( $lines );
 		$lines[] = 'FINDINGS';
-		$lines[] = str_repeat( '-', 80 );
+		$lines[] = str_repeat( '-', self::SCAN_LOG_SEPARATOR_WIDTH );
 
 		$sections = [];
 		foreach ( $report['findings'] as $finding ) {
@@ -5520,7 +6585,7 @@ PHP;
 		foreach ( $sections as $section => $findings ) {
 			$count = count( $findings );
 			$lines[] = sprintf( '%s (%d finding%s)', strtoupper( $section ), $count, 1 === $count ? '' : 's' );
-			$lines[] = str_repeat( '-', 80 );
+			$lines[] = str_repeat( '-', self::SCAN_LOG_SEPARATOR_WIDTH );
 
 			if ( 'Plugins' === $section ) {
 				$issue_number = 1;
@@ -5530,26 +6595,53 @@ PHP;
 				}
 
 				$integrity_groups = $this->group_plugin_integrity_changes_by_problem();
-				if ( ! empty( $integrity_groups ) ) {
-					$lines[] = 'Plugin integrity changes';
-					foreach ( $integrity_groups as $problem => $locations ) {
-						$lines[] = '  ' . $problem;
-						foreach ( $locations as $location ) {
-							$lines[] = '    - ' . $location;
-						}
-						$lines[] = '';
+				foreach ( $integrity_groups as $problem => $integrity_group ) {
+					$lines[] = '[CRITICAL] Plugin integrity changes';
+					$lines[] = 'Plugins: ' . implode( ', ', $integrity_group['plugins'] );
+					$lines[] = 'Problem: ' . $problem;
+					$lines[] = 'Files:';
+					foreach ( $integrity_group['files'] as $location ) {
+						$lines[] = '  - ' . $location;
 					}
+					$lines[] = '';
 				}
 				continue;
 			}
 
 			$issue_number = 1;
 			foreach ( $this->group_findings_by_problem( $findings ) as $issue ) {
-				$this->append_scan_log_issue( $lines, $issue, $issue_number );
+				if ( 'Users & persistence' === $section ) {
+					$this->append_scan_log_users_issue( $lines, $issue, $issue_number );
+				} else {
+					$this->append_scan_log_issue( $lines, $issue, $issue_number );
+				}
 				$issue_number++;
 			}
 
 			$lines[] = '';
+		}
+
+		if ( ! empty( $report['correlations'] ) ) {
+			$this->append_scan_log_major_section_gap( $lines );
+			$lines[] = 'CORRELATED INDICATORS';
+			$lines[] = str_repeat( '-', self::SCAN_LOG_SEPARATOR_WIDTH );
+			$correlation_number = 1;
+			foreach ( $report['correlations'] as $correlation ) {
+				$lines[] = sprintf(
+					'[%d] %s | %d%% confidence',
+					$correlation_number,
+					strtoupper( (string) $correlation['severity'] ),
+					(int) $correlation['confidence']
+				);
+				$lines[] = '    Indicator: ' . (string) $correlation['description'];
+				$lines[] = '    Seen in: ' . implode( ', ', $correlation['sections'] );
+				$lines[] = '    Locations:';
+				foreach ( $correlation['locations'] as $location ) {
+					$lines[] = '      - [' . $location['section'] . '] ' . $location['location'];
+				}
+				$lines[] = '';
+				$correlation_number++;
+			}
 		}
 
 		$plugin_findings = array_values(
@@ -5564,22 +6656,33 @@ PHP;
 		if ( ! empty( $recommendations ) || ! empty( $this->inactive_plugins ) || ! empty( $this->inactive_themes ) ) {
 			$this->append_scan_log_major_section_gap( $lines );
 			$lines[] = 'RECOMMENDATIONS';
-			$lines[] = str_repeat( '-', 80 );
-			foreach ( $recommendations as $recommendation ) {
-				$lines[] = sprintf( '[%s] %s', strtoupper( $recommendation['action'] ), $recommendation['slug'] );
-				$lines[] = '  Reason: ' . $recommendation['reason'];
+			$lines[] = str_repeat( '-', self::SCAN_LOG_SEPARATOR_WIDTH );
+			foreach ( $this->group_plugin_recommendations( $recommendations ) as $recommendation_group ) {
+				$lines[] = sprintf( '[%s] %s', strtoupper( $recommendation_group['action'] ), $recommendation_group['reason'] );
+				$lines[] = '  Plugins:';
+				foreach ( $recommendation_group['slugs'] as $slug ) {
+					$lines[] = '    - ' . $slug;
+				}
 				$lines[] = '';
 			}
 			if ( ! empty( $this->inactive_plugins ) ) {
-				$count = count( $this->inactive_plugins );
 				$lines[] = '[CLEANUP] Inactive plugins';
-				$lines[] = sprintf( '  %d inactive plugin%s detected and %s. Remove %s if not needed.', $count, 1 === $count ? '' : 's', $this->full_scan ? 'included in the full scan' : 'not scanned', 1 === $count ? 'it' : 'them' );
+				$lines[] = 'Plugins:';
+				foreach ( $this->inactive_code_display_list( $this->inactive_plugins ) as $plugin ) {
+					$lines[] = '  - ' . $plugin;
+				}
+				$lines[] = 'Status: ' . ( $this->full_scan ? 'Included in the full scan.' : 'Not scanned.' );
+				$lines[] = 'Action: Remove if not needed.';
 				$lines[] = '';
 			}
 			if ( ! empty( $this->inactive_themes ) ) {
-				$count = count( $this->inactive_themes );
 				$lines[] = '[CLEANUP] Inactive themes';
-				$lines[] = sprintf( '  %d inactive theme%s detected and %s. Remove %s if not needed.', $count, 1 === $count ? '' : 's', $this->full_scan ? 'included in the full scan' : 'not scanned', 1 === $count ? 'it' : 'them' );
+				$lines[] = 'Themes:';
+				foreach ( $this->inactive_code_display_list( $this->inactive_themes ) as $theme ) {
+					$lines[] = '  - ' . $theme;
+				}
+				$lines[] = 'Status: ' . ( $this->full_scan ? 'Included in the full scan.' : 'Not scanned.' );
+				$lines[] = 'Action: Remove if not needed.';
 				$lines[] = '';
 			}
 		}
@@ -5599,6 +6702,133 @@ PHP;
 		$lines[] = '';
 	}
 
+	/**
+	 * Append one Users & persistence issue with structured user rows when possible.
+	 */
+	private function append_scan_log_users_issue( array &$lines, array $issue, $number ) {
+		$locations = $this->grouped_issue_locations( $issue );
+		$parsed = [];
+		$type = null;
+
+		foreach ( $locations as $location ) {
+			$row = $this->parse_scan_log_user_location( $location );
+			if ( null === $row || ( null !== $type && $type !== $row['type'] ) ) {
+				$this->append_scan_log_issue( $lines, $issue, $number );
+				return;
+			}
+			$type = $row['type'];
+			$parsed[] = $row['values'];
+		}
+
+		if ( empty( $parsed ) ) {
+			$this->append_scan_log_issue( $lines, $issue, $number );
+			return;
+		}
+
+		$lines[] = sprintf(
+			'[%d] %s | %d%% confidence',
+			(int) $number,
+			strtoupper( (string) $issue['severity'] ),
+			(int) $issue['confidence']
+		);
+		$lines[] = '    Problem: ' . (string) $issue['description'];
+		$lines[] = '    Users:';
+
+		if ( 'account' === $type ) {
+			$this->append_scan_log_columns(
+				$lines,
+				[ 'ID', 'Login', 'Email', 'Roles', 'Registered', 'Context' ],
+				$parsed
+			);
+		} elseif ( 'direct_capabilities' === $type ) {
+			$this->append_scan_log_columns(
+				$lines,
+				[ 'ID', 'Login', 'Direct capabilities' ],
+				$parsed
+			);
+		} else {
+			$this->append_scan_log_columns(
+				$lines,
+				[ 'ID', 'Login', 'Application password', 'Created', 'Last used', 'Last IP' ],
+				$parsed
+			);
+		}
+
+		$lines[] = '';
+	}
+
+	/**
+	 * Parse known user finding locations into stable report columns.
+	 */
+	private function parse_scan_log_user_location( $location ) {
+		$location = (string) $location;
+
+		if ( preg_match( '/^user #(\d+) · (.*?) · (.*?) · roles?: (.*?) · registered (.*?) UTC(?: · cluster: (.*))?$/', $location, $matches ) ) {
+			return [
+				'type'   => 'account',
+				'values' => [
+					'#' . $matches[1],
+					$matches[2],
+					$matches[3],
+					$matches[4],
+					$matches[5] . ' UTC',
+					isset( $matches[6] ) && '' !== $matches[6] ? $matches[6] : '-',
+				],
+			];
+		}
+
+		if ( preg_match( '/^user #(\d+) · (.*?) · direct capabilities: (.*)$/', $location, $matches ) ) {
+			return [
+				'type'   => 'direct_capabilities',
+				'values' => [ '#' . $matches[1], $matches[2], $matches[3] ],
+			];
+		}
+
+		if ( preg_match( '/^user #(\d+) · (.*?) · application password: (.*?) · created (.*?) UTC(?: · last used (.*?) UTC)?(?: · last IP: (.*))?$/', $location, $matches ) ) {
+			return [
+				'type'   => 'application_password',
+				'values' => [
+					'#' . $matches[1],
+					$matches[2],
+					$matches[3],
+					$matches[4] . ' UTC',
+					isset( $matches[5] ) && '' !== $matches[5] ? $matches[5] . ' UTC' : '-',
+					isset( $matches[6] ) && '' !== $matches[6] ? $matches[6] : '-',
+				],
+			];
+		}
+
+		return null;
+	}
+
+	/**
+	 * Append an aligned plain-text table without truncating forensic values.
+	 */
+	private function append_scan_log_columns( array &$lines, array $headers, array $rows, $indent = '      ' ) {
+		$widths = array_map( 'strlen', $headers );
+		foreach ( $rows as $row ) {
+			foreach ( $headers as $index => $_header ) {
+				$value = isset( $row[ $index ] ) ? (string) $row[ $index ] : '';
+				$widths[ $index ] = max( $widths[ $index ], strlen( $value ) );
+			}
+		}
+
+		$render = static function ( array $values ) use ( $headers, $widths ) {
+			$parts = [];
+			$last = count( $headers ) - 1;
+			foreach ( $headers as $index => $_header ) {
+				$value = isset( $values[ $index ] ) ? (string) $values[ $index ] : '';
+				$parts[] = $index === $last ? $value : str_pad( $value, $widths[ $index ] );
+			}
+			return implode( '  ', $parts );
+		};
+
+		$lines[] = $indent . $render( $headers );
+		$lines[] = $indent . $render( array_map( static function ( $width ) { return str_repeat( '-', $width ); }, $widths ) );
+		foreach ( $rows as $row ) {
+			$lines[] = $indent . $render( $row );
+		}
+	}
 	/**
 	 * Append one grouped issue to the scan log in a triage-friendly layout.
 	 */
@@ -5637,50 +6867,6 @@ PHP;
 		}
 
 		\WP_CLI::success( 'Report written to ' . $output_file );
-	}
-
-	/**
-	 * Build clusters based on suspicious file modification times.
-	 */
-	private function build_finding_mtime_clusters( array $findings ) {
-		$buckets = [];
-
-		foreach ( $findings as $finding ) {
-			$location = $finding['location'];
-			$path = $this->content_dir . DIRECTORY_SEPARATOR . str_replace( '/', DIRECTORY_SEPARATOR, $location );
-			if ( ! is_file( $path ) ) {
-				continue;
-			}
-
-			$mtime = @filemtime( $path );
-			if ( false === $mtime ) {
-				continue;
-			}
-
-			$bucket = (int) floor( $mtime / 600 ) * 600;
-			$buckets[ $bucket ][ $location ] = true;
-		}
-
-		$clusters = [];
-		foreach ( $buckets as $timestamp => $paths ) {
-			if ( count( $paths ) < 2 ) {
-				continue;
-			}
-
-			$clusters[] = [
-				'time'  => gmdate( 'Y-m-d H:i', $timestamp ) . ' UTC',
-				'files' => count( $paths ),
-			];
-		}
-
-		usort(
-			$clusters,
-			function ( $a, $b ) {
-				return strcmp( $b['time'], $a['time'] );
-			}
-		);
-
-		return array_slice( $clusters, 0, 10 );
 	}
 
 	/**
@@ -5770,13 +6956,6 @@ PHP;
 	private function sanitize_key_value( $key ) {
 		$key = strtolower( (string) $key );
 		return preg_replace( '/[^a-z0-9_\-]/', '', $key );
-	}
-
-	/**
-	 * Strip common WP-CLI prefixes.
-	 */
-	private function strip_wp_cli_prefix( $line ) {
-		return preg_replace( '~^(?:Warning|Error|Success):\s*~i', '', $line );
 	}
 
 	/**

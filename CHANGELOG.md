@@ -1,5 +1,35 @@
 # Changelog
 
+## [1.1.0] - 2026-09-03
+
+### Added
+
+- Added opt-in `--deep-database` mode to the main and `database` commands. It discovers current-site custom tables, excludes WordPress core/global and other multisite-blog tables, and scans text-like columns with the existing IOC/database/JavaScript rules.
+- Deep custom-table scans use numeric-primary-key keyset pagination when possible and bounded `LIMIT/OFFSET` fallback for unconventional schemas.
+- Added PHP semantic outbound-transfer detection for sensitive request/session data reaching WordPress HTTP calls, cURL, mail, remote URL reads, and socket writes. The layer tracks credential/session/payment-like sources through assignments and local helper functions without treating ordinary form/webhook forwarding as suspicious by itself.
+- Added upload media/container validation for common JPEG, PNG, GIF, WebP, AVIF, ICO, BMP, TIFF, and PDF extensions using bounded signature/structure checks without image/PDF libraries. Media files whose bytes do not match the declared extension are reported, and PNG/JPEG/WebP/PDF containers are checked for truncation or suspicious script/executable payloads appended after the logical container end.
+- Expanded persistence auditing with recent application-password review on privileged accounts, direct administrative capability grants, modified/custom role capability checks, and active Action Scheduler IOC/persistence scanning.
+- Added cross-layer exact-IOC correlation so the detailed log/Markdown report can show when the same known indicator appears across multiple scan layers without inflating finding counts or severity totals.
+
+### Changed
+
+- Scan-log timestamps now use the site-local WordPress timezone (`timezone_string`, with `gmt_offset` fallback) while the normalized report timestamp remains UTC for machine-readable output.
+- Inactive plugin/theme CLEANUP recommendations in `security-scan.log` now list each affected plugin/theme by name and slug, plus concise scan status and removal guidance.
+- Simplified the scan-log header to a single timestamped `WORDPRESS SECURITY SCAN:` line followed by a 68-character ASCII separator.
+- Reformatted plugin integrity log entries as explicit `[CRITICAL] Plugin integrity changes` blocks with separate `Plugins`, `Problem`, and `Files` fields.
+- Reformatted structured Users & persistence findings into aligned plain-text columns for account, direct-capability, and application-password details while keeping cron/Action Scheduler locations in the standard layout.
+- Cached direct-DB table existence and column metadata lookups within a scan run, removed redundant recent-user filtering before burst analysis, and removed obsolete unused helper code.
+- Removed the Summary block from `security-scan.log`; Summary remains console-only while the log now focuses on Findings and Recommendations.
+- Marked grouped plugin integrity changes as `CRITICAL` in the scan log without changing checksum verification or remediation behavior.
+- Grouped Recommendations by action and user-facing reason so plugins with the same remediation are listed under one concise recommendation in scan logs, Markdown, and detailed terminal renderers.
+- Added a checksum-verified plugin fast path: verified WordPress.org plugins skip static/semantic/density analysis that would be suppressed anyway and retain only executable-file exact `CRITICAL` IOC coverage at 97%+ confidence, matching the existing reportability policy.
+- Removed the unused suspicious-file modification-time clustering pass; cross-layer IOC correlation now provides explicit report context instead of computing unrendered timestamp buckets.
+
+### Tests
+
+- Added regression coverage for verified-plugin fast-path equivalence, grouped recommendation rendering, current-site custom-table deep database discovery/scanning, sensitive outbound data-flow with false-positive controls for ordinary webhook/contact traffic, upload container signature/boundary validation, expanded persistence checks, Action Scheduler scanning, and cross-layer IOC correlation.
+- Expanded report/DB regression coverage for the timestamped log header, critical plugin-integrity `Plugins/Problem/Files` layout, aligned Users & persistence columns, and cached table-column metadata.
+
 ## [1.0.0] - 2026-09-02
 
 ### Changed

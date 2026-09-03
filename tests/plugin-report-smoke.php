@@ -147,7 +147,7 @@ WP_CLI::$logs = [];
 $recommendations->invoke( $command, $groups );
 $recommendation_output = implode( "\n", WP_CLI::$logs );
 
-if ( false === strpos( $recommendation_output, 'HIGH PRIORITY — Multiple high-risk findings detected' ) || false === strpos( $recommendation_output, '  ⚠ reinstall-plugin' ) ) {
+if ( false === strpos( $recommendation_output, 'HIGH PRIORITY — Multiple high-risk findings were detected' ) || false === strpos( $recommendation_output, '  ⚠ reinstall-plugin' ) ) {
 	fwrite( STDERR, "High-risk reinstall recommendation is missing or not grouped.\n" );
 	exit( 1 );
 }
@@ -164,6 +164,20 @@ if ( false === strpos( $recommendation_output, '2 inactive plugins detected — 
 
 if ( false === strpos( $recommendation_output, '1 inactive theme detected — not scanned; remove it if not needed.' ) ) {
 	fwrite( STDERR, "Inactive theme recommendation is missing.\n" );
+	exit( 1 );
+}
+
+
+$grouped_recommendations = [
+	[ 'slug' => 'one', 'action' => 'review', 'reason' => 'Suspicious findings require manual review.', 'count' => 1 ],
+	[ 'slug' => 'two', 'action' => 'review', 'reason' => 'Suspicious findings require manual review.', 'count' => 1 ],
+	[ 'slug' => 'three', 'action' => 'review', 'reason' => 'High-confidence findings remain despite verified files.', 'count' => 1 ],
+];
+$group_method = new ReflectionMethod( $command, 'group_plugin_recommendations' );
+$group_method->setAccessible( true );
+$recommendation_groups = $group_method->invoke( $command, $grouped_recommendations );
+if ( 2 !== count( $recommendation_groups ) || [ 'one', 'two' ] !== $recommendation_groups[1]['slugs'] ) {
+	fwrite( STDERR, "Recommendations must group plugins by action and user-facing reason.\n" );
 	exit( 1 );
 }
 

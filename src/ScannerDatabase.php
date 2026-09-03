@@ -9,6 +9,7 @@ class Security_Scan_Database {
 	private $connection;
 	private $prefix = '';
 	private $base_prefix = '';
+	private $table_exists_cache = [];
 
 	public $posts = '';
 	public $postmeta = '';
@@ -217,9 +218,15 @@ class Security_Scan_Database {
 	}
 
 	public function table_exists( $table ) {
+		$table = (string) $table;
+		if ( array_key_exists( $table, $this->table_exists_cache ) ) {
+			return $this->table_exists_cache[ $table ];
+		}
+
 		$like = $this->esc_like( $table );
 		$found = $this->get_var( $this->prepare( 'SHOW TABLES LIKE %s', $like ) );
-		return (string) $found === (string) $table;
+		$this->table_exists_cache[ $table ] = (string) $found === $table;
+		return $this->table_exists_cache[ $table ];
 	}
 
 	private function query( $query ) {

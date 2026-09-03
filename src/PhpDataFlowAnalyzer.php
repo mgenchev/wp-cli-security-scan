@@ -53,6 +53,7 @@ class Security_Scan_Php_Data_Flow_Analyzer {
 	private const FILE_WRITE_SINKS = [
 		'file_put_contents',
 		'fwrite',
+		'fputs',
 		'copy',
 		'rename',
 		'move_uploaded_file',
@@ -75,6 +76,41 @@ class Security_Scan_Php_Data_Flow_Analyzer {
 		'filter_input',
 		'getallheaders',
 		'apache_request_headers',
+	];
+
+	private const OUTBOUND_HTTP_SINKS = [
+		'wp_remote_get',
+		'wp_remote_post',
+		'wp_remote_request',
+		'wp_safe_remote_get',
+		'wp_safe_remote_post',
+		'wp_safe_remote_request',
+	];
+
+	private const OUTBOUND_MAIL_SINKS = [
+		'mail',
+		'wp_mail',
+	];
+
+	private const SOCKET_OPEN_FUNCTIONS = [
+		'fsockopen',
+		'pfsockopen',
+		'socket_create',
+		'socket_create_listen',
+		'socket_import_stream',
+		'socket_accept',
+		'socket_addrinfo_bind',
+		'socket_addrinfo_connect',
+		'socket_wsaprotocol_info_import',
+		'stream_socket_client',
+	];
+
+	private const SOCKET_WRITE_FUNCTIONS = [
+		'socket_write',
+		'socket_send',
+		'socket_sendto',
+		'socket_sendmsg',
+		'stream_socket_sendto',
 	];
 
 	private const CALLBACK_SINKS = [
@@ -484,6 +520,65 @@ class Security_Scan_Php_Data_Flow_Analyzer {
 			return $this->merge_argument_states( $args );
 		}
 
+		if ( 'curl_init' === $name ) {
+			$state = isset( $args[0] ) ? $args[0] : $this->empty_state();
+			$state['transport'] = 'curl';
+			return $state;
+		}
+
+		if ( 'curl_setopt' === $name ) {
+			$this->apply_curl_setopt( $argument_tokens, $args );
+			return $this->empty_state();
+		}
+
+		if ( 'curl_setopt_array' === $name ) {
+			$this->apply_curl_setopt_array( $argument_tokens, $args );
+			return $this->empty_state();
+		}
+
+		if ( 'curl_exec' === $name ) {
+			$handle = isset( $args[0] ) ? $args[0] : $this->empty_state();
+			$this->report_outbound_sink( 'HTTP', $handle, $this->empty_state(), $line, 'dataflow_sensitive_curl_exfil' );
+			$response = $this->empty_state();
+			$response['remote'] = true;
+			return $response;
+		}
+
+		if ( in_array( $name, self::SOCKET_OPEN_FUNCTIONS, true ) ) {
+			$state = $this->merge_argument_states( $args );
+			$state['transport'] = 'socket';
+			return $state;
+		}
+
+		if ( 'socket_connect' === $name && isset( $args[0] ) ) {
+			$this->merge_state_into_argument_variable( $argument_tokens, 0, $this->merge_argument_states( array_slice( $args, 1 ) ), 'socket' );
+			return $this->empty_state();
+		}
+
+		if ( in_array( $name, self::SOCKET_WRITE_FUNCTIONS, true ) ) {
+			$handle = isset( $args[0] ) ? $args[0] : $this->empty_state();
+			$content = isset( $args[1] ) ? $args[1] : $this->empty_state();
+			if ( 'socket_sendmsg' === $name ) {
+				$content = isset( $args[1] ) ? $args[1] : $content;
+			}
+			$this->report_outbound_sink( 'socket', $content, $handle, $line, 'dataflow_sensitive_socket_exfil' );
+			return $this->empty_state();
+		}
+
+		if ( in_array( $name, self::OUTBOUND_HTTP_SINKS, true ) ) {
+			$target = isset( $args[0] ) ? $args[0] : $this->empty_state();
+			$payload = $target;
+			if ( false === strpos( $name, '_get' ) && isset( $args[1] ) ) {
+				$payload = $this->merge_states( $payload, $args[1] );
+			}
+			$this->report_outbound_sink( 'HTTP', $payload, $target, $line, 'dataflow_sensitive_http_exfil' );
+		}
+
+		if ( in_array( $name, self::OUTBOUND_MAIL_SINKS, true ) ) {
+			$payload = $this->merge_argument_states( array_slice( $args, 1 ) );
+			$this->report_outbound_sink( 'email', $payload, isset( $args[0] ) ? $args[0] : $this->empty_state(), $line, 'dataflow_sensitive_mail_exfil' );
+		}
+
 		if ( in_array( $name, self::COMMAND_SINKS, true ) ) {
 			$input = isset( $args[0] ) ? $args[0] : $this->empty_state();
 			if ( $input['tainted'] ) {
@@ -560,11 +655,18 @@ class Security_Scan_Php_Data_Flow_Analyzer {
 		}
 
 		if ( in_array( $name, self::REQUEST_SOURCE_FUNCTIONS, true ) ) {
-			return $this->tainted_state( 'request-function' );
+			if ( 'filter_input' === $name ) {
+				$field = isset( $args[1] ) && null !== $args[1]['literal'] ? (string) $args[1]['literal'] : '*';
+				return $this->tainted_state( 'filter_input[' . $field . ']' );
+			}
+			return $this->tainted_state( 'request-headers' );
 		}
 
 		if ( in_array( $name, self::REMOTE_SOURCES, true ) ) {
 			$state = $this->merge_argument_states( $args );
+			if ( in_array( $name, [ 'file_get_contents', 'fopen' ], true ) && isset( $args[0] ) && $args[0]['remote_url_hint'] ) {
+				$this->report_outbound_sink( 'HTTP', $args[0], $args[0], $line, 'dataflow_sensitive_url_exfil' );
+			}
 			$state['remote'] = true;
 			if ( 'file_get_contents' === $name || 'fopen' === $name ) {
 				$first = isset( $args[0] ) ? $args[0] : $this->empty_state();
@@ -630,12 +732,18 @@ class Security_Scan_Php_Data_Flow_Analyzer {
 		$path = $this->empty_state();
 		$content = $this->empty_state();
 
+		if ( in_array( $name, [ 'fwrite', 'fputs' ], true ) && isset( $args[0] ) && 'socket' === $args[0]['transport'] ) {
+			$content = isset( $args[1] ) ? $args[1] : $this->empty_state();
+			$this->report_outbound_sink( 'socket', $content, $args[0], $line, 'dataflow_sensitive_socket_exfil' );
+		}
+
 		switch ( $name ) {
 			case 'file_put_contents':
 				$path = isset( $args[0] ) ? $args[0] : $this->empty_state();
 				$content = isset( $args[1] ) ? $args[1] : $this->empty_state();
 				break;
 			case 'fwrite':
+			case 'fputs':
 				$content = isset( $args[1] ) ? $args[1] : $this->empty_state();
 				break;
 			case 'copy':
@@ -669,6 +777,85 @@ class Security_Scan_Php_Data_Flow_Analyzer {
 		if ( $path['tainted'] && ( $content['tainted'] || $content['decoded'] || $content['remote'] ) ) {
 			$this->add_finding( 'high', 94, 'dataflow_arbitrary_file_write', 'Request-controlled path and untrusted content reach a filesystem write', $line, true );
 		}
+	}
+
+	private function apply_curl_setopt( array $argument_tokens, array $args ) {
+		if ( ! isset( $args[0], $args[2] ) ) {
+			return;
+		}
+
+		$this->merge_state_into_argument_variable( $argument_tokens, 0, $args[2], 'curl' );
+	}
+
+	private function apply_curl_setopt_array( array $argument_tokens, array $args ) {
+		if ( ! isset( $args[0], $args[1] ) ) {
+			return;
+		}
+
+		$this->merge_state_into_argument_variable( $argument_tokens, 0, $args[1], 'curl' );
+	}
+
+	private function merge_state_into_argument_variable( array $argument_tokens, $argument_index, array $extra_state, $transport = null ) {
+		if ( ! isset( $argument_tokens[ $argument_index ] ) ) {
+			return;
+		}
+
+		$tokens = $this->trim_tokens( $argument_tokens[ $argument_index ] );
+		if ( empty( $tokens ) || T_VARIABLE !== $tokens[0]['id'] ) {
+			return;
+		}
+
+		$ref = $this->parse_variable_reference( $tokens, 0 );
+		if ( null === $ref ) {
+			return;
+		}
+
+		$state = $this->merge_states( $this->get_variable_state( $ref['key'] ), $extra_state );
+		if ( null !== $transport ) {
+			$state['transport'] = $transport;
+		}
+		$this->set_variable_state( $ref['key'], $state );
+	}
+
+	private function report_outbound_sink( $transport, array $payload, array $target, $line, $rule ) {
+		$summary_param = $this->has_summary_parameter_source( $payload );
+		if ( ! $payload['sensitive'] && ! $summary_param ) {
+			return;
+		}
+
+		$types = array_keys( $payload['sensitive_types'] );
+		$high_risk = ! empty( array_intersect( $types, [ 'authorization', 'credential', 'payment', 'session' ] ) );
+		$confidence = $high_risk ? 97 : 94;
+		$severity = 'high';
+
+		if ( $target['tainted'] && $payload['sensitive'] ) {
+			$confidence = 98;
+		}
+
+		if ( $summary_param && ! $payload['sensitive'] ) {
+			$confidence = 95;
+			$severity = 'high';
+		}
+
+		$this->add_finding(
+			$severity,
+			$confidence,
+			$rule,
+			'Sensitive request/session data is sent through outbound ' . $transport,
+			$line,
+			true,
+			$payload['sources']
+		);
+	}
+
+	private function has_summary_parameter_source( array $state ) {
+		foreach ( array_keys( $state['sources'] ) as $source ) {
+			if ( 0 === strpos( $source, 'param:' ) ) {
+				return true;
+			}
+		}
+
+		return false;
 	}
 
 	private function evaluate_decoder( $name, array $args, $line ) {
@@ -929,6 +1116,7 @@ class Security_Scan_Php_Data_Flow_Analyzer {
 		}
 
 		foreach ( $this->function_summaries[ $name ] as $summary ) {
+			$family = $this->sink_family_from_rule( $summary['rule'] );
 			$triggered = false;
 			$sources = [];
 			foreach ( $summary['param_indexes'] as $param_index ) {
@@ -936,7 +1124,10 @@ class Security_Scan_Php_Data_Flow_Analyzer {
 					continue;
 				}
 				$arg = $args[ $param_index ];
-				if ( $arg['tainted'] || $arg['decoded'] || $arg['remote'] ) {
+				$matches = 'exfiltration' === $family
+					? $arg['sensitive']
+					: ( $arg['tainted'] || $arg['decoded'] || $arg['remote'] );
+				if ( $matches ) {
 					$triggered = true;
 					$sources += $arg['sources'];
 				}
@@ -946,13 +1137,16 @@ class Security_Scan_Php_Data_Flow_Analyzer {
 				continue;
 			}
 
-			$family = $this->sink_family_from_rule( $summary['rule'] );
 			$rule = 'dataflow_local_function_' . preg_replace( '~[^a-z0-9_]+~', '_', $name ) . '_' . $family;
+			$description = 'Untrusted argument reaches ' . $this->sink_family_label( $family ) . ' through local function ' . $name . '()';
+			if ( 'exfiltration' === $family ) {
+				$description = 'Sensitive request/session argument reaches an outbound transfer through local function ' . $name . '()';
+			}
 			$this->add_finding(
 				$summary['severity'],
 				min( 98, max( 90, (int) $summary['confidence'] ) ),
 				$rule,
-				'Untrusted argument reaches ' . $this->sink_family_label( $family ) . ' through local function ' . $name . '()',
+				$description,
 				$line,
 				true,
 				$sources
@@ -961,6 +1155,9 @@ class Security_Scan_Php_Data_Flow_Analyzer {
 	}
 
 	private function sink_family_from_rule( $rule ) {
+		if ( false !== strpos( $rule, 'exfil' ) ) {
+			return 'exfiltration';
+		}
 		if ( false !== strpos( $rule, 'command' ) || false !== strpos( $rule, 'backtick' ) ) {
 			return 'command';
 		}
@@ -978,6 +1175,8 @@ class Security_Scan_Php_Data_Flow_Analyzer {
 
 	private function sink_family_label( $family ) {
 		switch ( $family ) {
+			case 'exfiltration':
+				return 'outbound transfer of sensitive request/session data';
 			case 'command':
 				return 'OS command execution';
 			case 'include':
@@ -999,7 +1198,7 @@ class Security_Scan_Php_Data_Flow_Analyzer {
 	private function get_variable_state( $key ) {
 		$root = preg_replace( '~\[.*$~', '', $key );
 		if ( in_array( $root, self::SUPERGLOBALS, true ) ) {
-			return $this->tainted_state( $root );
+			return $this->tainted_state( $key );
 		}
 
 		for ( $i = count( $this->scopes ) - 1; $i >= 0; $i-- ) {
@@ -1010,7 +1209,7 @@ class Security_Scan_Php_Data_Flow_Analyzer {
 			if ( false !== strpos( $key, '[' ) && isset( $this->scopes[ $i ]['vars'][ $root ] ) ) {
 				$parent = $this->scopes[ $i ]['vars'][ $root ];
 				if ( $parent['tainted'] ) {
-					return $parent;
+					return $this->refine_sensitive_state_for_reference( $parent, $key );
 				}
 			}
 
@@ -1030,11 +1229,15 @@ class Security_Scan_Php_Data_Flow_Analyzer {
 	private function empty_state() {
 		return [
 			'tainted'      => false,
+			'sensitive'    => false,
 			'literal'      => null,
 			'decoded'      => false,
 			'remote'       => false,
+			'remote_url_hint' => false,
 			'php_path_hint'=> false,
+			'transport'    => null,
 			'sources'      => [],
+			'sensitive_types' => [],
 			'transforms'   => [],
 		];
 	}
@@ -1042,6 +1245,7 @@ class Security_Scan_Php_Data_Flow_Analyzer {
 	private function literal_state( $literal ) {
 		$state = $this->empty_state();
 		$state['literal'] = (string) $literal;
+		$state['remote_url_hint'] = (bool) preg_match( '~(?:https?|ftp)://~i', $state['literal'] );
 		$state['php_path_hint'] = (bool) preg_match( '~\.(?:php\d*|phtml|phar)(?:$|[?#])~i', $state['literal'] );
 		return $state;
 	}
@@ -1050,17 +1254,57 @@ class Security_Scan_Php_Data_Flow_Analyzer {
 		$state = $this->empty_state();
 		$state['tainted'] = true;
 		$state['sources'][ $source ] = true;
+		foreach ( $this->sensitive_types_for_source( $source ) as $type ) {
+			$state['sensitive'] = true;
+			$state['sensitive_types'][ $type ] = true;
+		}
 		return $state;
 	}
 
 	private function merge_states( array $left, array $right ) {
 		$state = $this->empty_state();
 		$state['tainted'] = $left['tainted'] || $right['tainted'];
+		$state['sensitive'] = $left['sensitive'] || $right['sensitive'];
 		$state['decoded'] = $left['decoded'] || $right['decoded'];
 		$state['remote'] = $left['remote'] || $right['remote'];
+		$state['remote_url_hint'] = $left['remote_url_hint'] || $right['remote_url_hint'];
 		$state['php_path_hint'] = $left['php_path_hint'] || $right['php_path_hint'];
+		$state['transport'] = null !== $left['transport'] ? $left['transport'] : $right['transport'];
 		$state['sources'] = $left['sources'] + $right['sources'];
+		$state['sensitive_types'] = $left['sensitive_types'] + $right['sensitive_types'];
 		$state['transforms'] = $left['transforms'] + $right['transforms'];
+		return $state;
+	}
+
+	private function sensitive_types_for_source( $source ) {
+		$source = strtolower( (string) $source );
+		$types = [];
+
+		if ( false !== strpos( $source, '$_cookie' ) || false !== strpos( $source, 'http_cookie' ) ) {
+			$types['session'] = true;
+		}
+
+		if ( false !== strpos( $source, 'authorization' ) || false !== strpos( $source, 'php_auth_pw' ) || false !== strpos( $source, 'php_auth_user' ) ) {
+			$types['authorization'] = true;
+		}
+
+		if ( preg_match( '~(?:^|[^a-z0-9])(?:password|passwd|passphrase|pwd|client[_-]?secret|api[_-]?key|apikey|access[_-]?token|refresh[_-]?token|auth[_-]?token|bearer|jwt|private[_-]?key|secret)(?:$|[^a-z0-9])~i', $source ) ) {
+			$types['credential'] = true;
+		}
+
+		if ( preg_match( '~(?:^|[^a-z0-9])(?:card[_-]?(?:number|no)|credit[_-]?card|cc[_-]?(?:number|no)|pan|cvv|cvc|card[_-]?security|expiry|expiration)(?:$|[^a-z0-9])~i', $source ) ) {
+			$types['payment'] = true;
+		}
+
+		return array_keys( $types );
+	}
+
+	private function refine_sensitive_state_for_reference( array $state, $reference ) {
+		foreach ( $this->sensitive_types_for_source( $reference ) as $type ) {
+			$state['sensitive'] = true;
+			$state['sensitive_types'][ $type ] = true;
+		}
+
 		return $state;
 	}
 

@@ -22,8 +22,8 @@ $version = new ReflectionMethod( $command, 'version' );
 $version->setAccessible( true );
 WP_CLI::$logs = [];
 $version->invoke( $command );
-if ( false === strpos( implode( "\n", WP_CLI::$logs ), 'WP-CLI Security Scan 1.0.0' ) ) {
-	fwrite( STDERR, "Version command must report 1.0.0.\n" );
+if ( false === strpos( implode( "\n", WP_CLI::$logs ), 'WP-CLI Security Scan 1.1.0' ) ) {
+	fwrite( STDERR, "Version command must report 1.1.0.\n" );
 	exit( 1 );
 }
 
