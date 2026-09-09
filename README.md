@@ -423,6 +423,8 @@ wp security-scan --format=markdown --output=security-report.md
 
 Spinner/progress output is disabled for export modes, so JSON stdout remains machine-readable.
 
+During scanner execution, non-fatal PHP notices, warnings, and deprecations are suppressed so interactive output remains readable. If `wp-config.php` changes `error_reporting()` or installs its own error handler, the scanner re-applies its CLI diagnostics policy before scan stages begin; fatal PHP errors remain enabled.
+
 ## Core checksum scope
 
 Core integrity is scanner-owned. The scanner reads the installed version/locale from `wp-includes/version.php` as text, downloads the official MD5 manifest from `api.wordpress.org`, and compares the local core files directly. It preserves the previous WP-CLI default root scope: `wp-admin`, `wp-includes`, and root `wp-*` files are checked for unexpected files, while arbitrary unrelated root files/directories are not treated as core-integrity findings. `wp-content` entries from the core manifest are intentionally excluded because `wp-content` is handled by the package's dedicated malware/integrity stages. Remote manifest paths are validated as safe relative paths before any filesystem access.

@@ -319,6 +319,9 @@ class Security_Scan_Command {
 		try {
 			$this->initialize_scanner_runtime();
 		} finally {
+			// wp-config.php may change error_reporting() or install its own
+			// error handler. Re-assert scanner diagnostics before any scan stage.
+			$this->suppress_wordpress_debug();
 			$this->stop_background_spinner();
 			$this->release_finalization_guard();
 		}
@@ -460,17 +463,29 @@ class Security_Scan_Command {
 	}
 
 	/**
-	 * Disable WordPress debug mode for the lifetime of this scan process.
+	 * Suppress non-fatal PHP diagnostics for the lifetime of this scan process.
 	 *
-	 * The scanner does not load WordPress. Suppress PHP error display while the
-	 * clean local wp-config.php is evaluated and while diagnostic work runs.
-	 * Nothing is written back to wp-config.php.
+	 * WP-CLI and older dependencies can emit notices, warnings or deprecations
+	 * on newer PHP versions. Those messages corrupt the interactive spinner and
+	 * human-readable report, so consume them locally while keeping fatal error
+	 * levels enabled. Nothing is written back to wp-config.php.
 	 */
 	private function suppress_wordpress_debug() {
-		@ini_set( 'display_errors', '0' );
-		@ini_set( 'display_startup_errors', '0' );
-		error_reporting( 0 );
+		$fatal_levels = E_ERROR | E_PARSE | E_CORE_ERROR | E_COMPILE_ERROR | E_USER_ERROR | E_RECOVERABLE_ERROR;
+		$non_fatal_levels = E_WARNING | E_NOTICE | E_DEPRECATED | E_USER_WARNING | E_USER_NOTICE | E_USER_DEPRECATED | 2048;
 
+		error_reporting( $fatal_levels );
+
+		set_error_handler(
+			static function ( $severity ) use ( $non_fatal_levels ) {
+				if ( 0 !== ( $severity & $non_fatal_levels ) ) {
+					return true;
+				}
+
+				return false;
+			},
+			$non_fatal_levels
+		);
 	}
 
 	/**
@@ -548,7 +563,10 @@ class Security_Scan_Command {
 	 */
 	private function evaluate_wp_config_without_loading_wordpress() {
 		$table_prefix = null;
+		$config_error = null;
 		$buffer_level = ob_get_level();
+		$previous_display_errors = ini_get( 'display_errors' );
+		@ini_set( 'display_errors', '0' );
 		ob_start();
 
 		try {
@@ -556,14 +574,24 @@ class Security_Scan_Command {
 			// WP-CLI itself uses this stripped code for before_wp_load config commands.
 			eval( $code );
 		} catch ( \Throwable $e ) {
-			while ( ob_get_level() > $buffer_level ) {
-				ob_end_clean();
-			}
-			\WP_CLI::error( 'Unable to read wp-config.php for isolated scanning: ' . $e->getMessage() );
+			$config_error = $e;
 		}
 
 		while ( ob_get_level() > $buffer_level ) {
 			ob_end_clean();
+		}
+
+		if ( false !== $previous_display_errors ) {
+			@ini_set( 'display_errors', (string) $previous_display_errors );
+		}
+
+		// A legitimate wp-config.php can alter PHP diagnostics or install its
+		// own handler for the web runtime. Those settings must not leak into
+		// the isolated CLI scanner.
+		$this->suppress_wordpress_debug();
+
+		if ( $config_error instanceof \Throwable ) {
+			\WP_CLI::error( 'Unable to read wp-config.php for isolated scanning: ' . $config_error->getMessage() );
 		}
 
 		return is_string( $table_prefix ) ? $table_prefix : '';
