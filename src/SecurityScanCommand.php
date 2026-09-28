@@ -3175,6 +3175,13 @@ class Security_Scan_Command {
 	 * @param bool   $is_uploads Whether uploads-specific rules apply.
 	 */
 	private function scan_file( $stage, $path, $is_uploads ) {
+		// Scanner-owned output must never reach the rules engine. Keep this guard
+		// at the lowest common file-scanning boundary so every current and future
+		// filesystem stage gets the same protection.
+		if ( $this->is_scanner_output_path( $path ) ) {
+			return;
+		}
+
 		$extension = strtolower( pathinfo( $path, PATHINFO_EXTENSION ) );
 		$relative = $this->relative_wp_content_path( $path );
 		$seen = [];
@@ -6865,7 +6872,24 @@ PHP;
 		$expected = rtrim( $this->normalize_path( $this->scan_log_path ), '/' );
 		$current = rtrim( $this->normalize_path( $path ), '/' );
 
-		return '' !== $expected && $expected === $current;
+		if ( '' !== $expected && $expected === $current ) {
+			return true;
+		}
+
+		// The same physical file can be reached through different lexical paths
+		// when the WordPress root or wp-content is symlinked. Compare canonical
+		// paths as well so scanner output cannot be re-scanned through an alias.
+		$expected_real = realpath( $this->scan_log_path );
+		$current_real = realpath( $path );
+
+		if ( false === $expected_real || false === $current_real ) {
+			return false;
+		}
+
+		$expected_real = rtrim( $this->normalize_path( $expected_real ), '/' );
+		$current_real = rtrim( $this->normalize_path( $current_real ), '/' );
+
+		return '' !== $expected_real && $expected_real === $current_real;
 	}
 
 	/**

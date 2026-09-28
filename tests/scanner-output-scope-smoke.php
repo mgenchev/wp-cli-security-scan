@@ -87,6 +87,37 @@ if ( 1 !== $scanned_ref->getValue( $command ) ) {
 	echo "PASS  file count excludes scanner-owned output\n";
 }
 
+// The scanner-owned log may be reached through a different lexical path when
+// wp-content or the launch directory is symlinked. Physical identity must win.
+$alias_root = $root . '-alias';
+if ( function_exists( 'symlink' ) && @symlink( $root, $alias_root ) ) {
+	$is_output = $reflection->getMethod( 'is_scanner_output_path' );
+	$is_output->setAccessible( true );
+
+	if ( ! $is_output->invoke( $command, $alias_root . '/security-scan.log' ) ) {
+		echo "FAIL  scanner-owned output was not recognized through symlink alias\n";
+		$failed++;
+	} else {
+		echo "PASS  scanner-owned output recognized through symlink alias\n";
+	}
+
+	@unlink( $alias_root );
+}
+
+// scan_file() is the final safety boundary. Direct callers must not be able to
+// feed scanner-owned output into the rules engine even if an iterator misses it.
+$findings_ref->setValue( $command, [] );
+$scan_file = $reflection->getMethod( 'scan_file' );
+$scan_file->setAccessible( true );
+$scan_file->invoke( $command, 'Other wp-content', $owned_log, false );
+
+if ( ! empty( $findings_ref->getValue( $command ) ) ) {
+	echo "FAIL  direct scan_file call scanned scanner-owned output\n";
+	$failed++;
+} else {
+	echo "PASS  scan_file rejects scanner-owned output\n";
+}
+
 @unlink( $owned_log );
 @unlink( $other_log );
 @rmdir( $nested );
